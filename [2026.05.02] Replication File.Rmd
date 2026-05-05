@@ -1,0 +1,3768 @@
+---
+title: '[2025.03.09] Simulations'
+author: "Anonymous"
+date: "2024-09-09"
+output: html_document
+---
+
+## Preliminaries
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+library(sandwich)
+library(lmtest)
+library(dplyr)
+library(sandwich)
+library(readr)
+library(lmtest)
+```
+
+# Load the data 
+
+```{r}
+data.2020 <- read.csv("data.ny.2020.csv")
+data.2021    <- read.csv("data.ny.2021.csv")
+data.2022   <- read.csv("data.ny.2022.csv")
+data.2023       <- read.csv("data.ny.2023.csv")
+data.2024   <- read.csv("data.ny.2024.csv")
+
+
+# data.2020 <- read_csv(
+#   "data.ny.2020.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# data.2021 <- read_csv(
+#   "data.ny.2021.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# data.2022 <- read_csv(
+#   "data.ny.2022.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# data.2023 <- read_csv(
+#   "data.ny.2023.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# data.2024 <- read_csv(
+#   "data.ny.2024.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+
+# Combine the data 
+data <- rbind(data.2020, data.2021, data.2022, data.2023, data.2024)
+
+
+# # Debugging
+# library(readr)
+# data.2020 <- read_csv(
+#   "data.ny.2020.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# nrow(data.2020)
+# problems(data.2020)
+
+```
+
+
+# Create the different varibles.
+
+```{r}
+# failure to appear
+w <- toupper(trimws(data$Warrant_Ordered_btw_Arraign_and_Dispo))
+d <- data$Release.Decision.at.Arraign == "Disposed at arraign"
+data$fta_flag <- ifelse(d, NA_real_, ifelse(w == "Y", 1, ifelse(w == "N", 0, NA_real_)))
+
+# release decisions
+data <- data %>%
+  mutate(release_v1 = ifelse(
+    Release.Decision.at.Arraign == "ROR" | Bail_Set_and_Posted_at_Arraign == "Y",
+    1, 0
+  )) # release_v1: defendant considered release iff they are released unconditionally or paid bail.
+
+data <- data %>%
+  mutate(release_v2 = ifelse(
+    Release.Decision.at.Arraign %in% c("ROR", "Nonmonetary release") | # more lenient
+      Bail_Set_and_Posted_at_Arraign == "Y",
+    1, 0
+  )) # release_v2: defendant considered release iff they are released with or without conditions.
+
+# Force NA when disposed at arraignment or unknown
+data <- data %>%
+  mutate(
+    release_v1 = ifelse(Release.Decision.at.Arraign %in% c("Disposed at arraign", "Unknown"), NA_real_, release_v1),
+    release_v2 = ifelse(Release.Decision.at.Arraign %in% c("Disposed at arraign", "Unknown"), NA_real_, release_v2)
+  )
+
+# # Force FTA to NA when defendant was not released under release_v1 
+# data <- data %>%
+#   mutate(
+#     fta_flag = ifelse(release_v1 == 0, NA_real_, fta_flag)
+#   )
+
+# Set new data object
+data.prelim <- data
+```
+
+
+# Remove cases with nominal $1 bail (often used to credit time served on a different case)
+```{r}
+data.prelim <- data.prelim %>%
+  filter(Region == "NYC") %>%            # keep only NYC cases
+  filter(First_Bail_Set_Cash != 1 | is.na(First_Bail_Set_Cash))  # exclude $1 cash bail
+```
+
+
+# Get bail-eligible charges vector and append to data (See the end of the file to see how this is done.)
+
+```{r}
+# load("[2026.03.10.1] qualifying.charges.any.RData") # old
+load("[2026.05.02] qualifying.charges.any.RData")
+data.prelim <- cbind(data.prelim, qualifying.charges.any)
+```
+
+# Further filtering based on qualifying vs. unqualifying charges. 
+The default is to consider only bail-ineligible offenses. To restrict analysis to bail eligible offenses, set runn process_release(TRUE) instead of process_release()
+
+```{r}
+process_release <- function(filter_qualifying = FALSE) {
+  
+  if (filter_qualifying) {
+    
+    # Keep only qualifying charges
+    data.prelim <<- data.prelim[data.prelim$qualifying.charges.any == 1, ]
+    
+  } else {
+    # Force FTA to NA when defendant was not released under release_v1 - you *MAY* WANT TO COMMENT OUT IF FOCUSING ON QUALIFYING CHARGES.
+  data.prelim <- data.prelim %>%
+    mutate(
+      fta_flag = ifelse(release_v1 == 0, NA_real_, fta_flag)
+    )
+    
+    # Set release_v2 = release_v1 for non-qualifying
+    idx <- data.prelim$qualifying.charges.any == 0
+    data.prelim$release_v2[idx] <<- data.prelim$release_v1[idx]
+    
+    # Keep only non-qualifying
+    data.prelim <<- data.prelim[idx, ]
+  }
+}
+
+# Non-Qualifying offenses
+process_release()
+
+# Qualifying offenses
+# process_release(TRUE)
+```
+
+# Filter out judges who hear fewer than 100 cases
+
+```{r}
+# Filter out fewer than 100 cases. 
+  ## get numbers
+  judge_release_table.prelim <- data.prelim %>%
+  group_by(Judge_Name) %>%
+  summarise(
+    n_cases = n(), # [2025.12.18] number of cases
+    pct_release_v1 = mean(release_v1, na.rm = TRUE) * 100,
+    pct_release_v2 = mean(release_v2, na.rm = TRUE) * 100
+  )
+  
+  ## judges with at least 100 cases (in the prelim table)
+keep_judges <- judge_release_table.prelim %>%
+  filter(n_cases >= 100) %>% # Standard
+  # filter(n_cases >= 150) %>% # Robustness check - A.7
+  # filter(n_cases >= 50) %>% # Robustness check - A.7
+    pull(Judge_Name)
+
+  ## filter data.prelim to only those judges
+  data.prelim.100 <- data.prelim %>%
+  filter(Judge_Name %in% keep_judges)
+  
+  ## complete the filtering
+  data.prelim <- data.prelim.100
+```
+
+# Quasi-Random Assignment Balance Tables - A.2
+
+```{r}
+# --- 1. Create LOO ---
+data.prelim <- data.prelim %>%
+  dplyr::group_by(Judge_Name) %>%
+  dplyr::mutate(
+    n = sum(!is.na(release_v2)),
+    s = sum(release_v2, na.rm = TRUE),
+    loo_leniency = ifelse(!is.na(release_v2) & n > 1,
+                          (s - release_v2) / (n - 1),
+                          NA_real_)
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(-n, -s)
+
+# --- 2. Clean + FE variable ---
+month_map <- c(Jan="01",Feb="02",Mar="03",Apr="04",May="05",Jun="06",
+               Jul="07",Aug="08",Sep="09",Oct="10",Nov="11",Dec="12")
+
+data.prelim$year_month <- paste0(trimws(data.prelim$Arrest.Year), "_",
+                                 month_map[trimws(data.prelim$Arrest_Month)])
+
+data.prelim$Age_at_Arrest <- as.numeric(trimws(data.prelim$Age_at_Arrest))
+data.prelim$loo_leniency  <- as.numeric(trimws(data.prelim$loo_leniency))
+data.prelim$any_prior <- as.numeric(
+  (as.numeric(trimws(data.prelim$prior_misd_cnt)) +
+   as.numeric(trimws(data.prelim$prior_nonvfo_cnt)) +
+   as.numeric(trimws(data.prelim$prior_vfo_cnt))) > 0
+)
+
+# --- 3. Regression with court × month FE ---
+results <- lm(
+  loo_leniency ~
+    I(Race == "White") +
+    I(Gender == "Male") +
+    Age_at_Arrest +
+    I(Arraign.Charge.Category == "Drug") +
+    I(Arraign.Charge.Category %in% c("DWI")) +
+    I(Representation_at_Securing_Order == "Y") +
+    any_prior +
+    factor(interaction(Court_Name, year_month)),
+  data = data.prelim
+)
+
+# --- 4. Two-way clustered SEs (individual + judge) ---
+vcov_2way <- vcovCL(results,
+                    cluster = data.prelim[, c("Judge_Name")])
+
+# --- 5. Print only main coefficients with stars ---
+ct <- coeftest(results, vcov = vcov_2way)
+printCoefmat(ct[1:15, ], signif.stars = TRUE)
+
+# F test
+
+library(car)
+
+joint_f_test <- linearHypothesis(
+  results,
+  c(
+    'I(Race == "White")TRUE = 0',
+    'I(Gender == "Male")TRUE = 0',
+    'Age_at_Arrest = 0',
+    'I(Arraign.Charge.Category == "Drug")TRUE = 0',
+    'I(Arraign.Charge.Category %in% c("DWI"))TRUE = 0',
+    'I(Representation_at_Securing_Order == "Y")TRUE = 0',
+    'any_prior = 0'
+  ),
+  vcov. = vcov_2way,
+  test = "F"
+)
+
+print(joint_f_test)
+```
+
+# Get judge info table
+
+```{r}
+judge_release_table <- data.prelim %>%
+  group_by(Judge_Name) %>%
+  summarise(
+    n_cases = n(),
+    pct_release_v1 = mean(release_v1, na.rm = TRUE) * 100,
+    pct_release_v2 = mean(release_v2, na.rm = TRUE) * 100,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    rank_v1 = min_rank(desc(pct_release_v1)),
+    rank_v2 = min_rank(desc(pct_release_v2))
+  ) %>%
+  mutate(
+    rank_diff = rank_v1 - rank_v2
+  )
+
+judge_fta_table <- data.prelim %>%
+  group_by(Judge_Name) %>%
+  summarise(
+    pct_fta = mean(fta_flag, na.rm = TRUE) * 100,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    rank_fta = min_rank(desc(pct_fta))
+  )
+
+judge.info.table.combined <- judge_release_table %>%
+  inner_join(judge_fta_table, by = "Judge_Name") %>%
+  mutate(
+    rank_diff_v1_fta = rank_v1 - rank_fta,
+    rank_diff_v2_fta = rank_v2 - rank_fta
+  )
+
+judge.info.table.combined
+```
+
+# Simulating Bootstrap outcomes based on judge
+
+```{r}
+set.seed(02138)
+
+simulate_judge_rates <- function(judge_row, nsim = 2000, seed = NULL) {
+  
+  # optional seed
+  # if (!is.null(seed)) set.seed(seed)
+  
+  # extract parameters
+  N <- judge_row$n_cases
+  p <- judge_row$pct_release_v2 / 100
+  q <- judge_row$pct_fta / 100
+  
+  # multinomial probabilities
+  prob_not_release   <- 1 - p
+  prob_release_nofta <- p * (1 - q)
+  prob_release_fta   <- p * q
+  
+  probs <- c(prob_not_release, prob_release_nofta, prob_release_fta)
+  
+  # simulate multinomial counts
+  sim_counts <- t(rmultinom(n = nsim, size = N, prob = probs))
+  colnames(sim_counts) <- c("C0_not_release", "C1_release_nofta", "C2_release_fta")
+  
+  sim_results <- as.data.frame(sim_counts) %>%
+    dplyr::mutate(
+      n_release = C1_release_nofta + C2_release_fta,
+      release_rate_sim = n_release / N,
+      fta_rate_sim = ifelse(n_release > 0, C2_release_fta / n_release, NA_real_)
+    )
+  
+  return(sim_results)
+}
+
+# apply to all judges
+sim_list <- setNames(
+  lapply(1:nrow(judge.info.table.combined), function(i) {
+    simulate_judge_rates(judge.info.table.combined[i, ], nsim = 2000)
+  }),
+  judge.info.table.combined$Judge_Name
+)
+
+# Simulation list save
+# save(sim_list, file = "[2026.03.24] sim_list.RData")
+
+```
+
+
+# Counterfactual Analysis - A.8 [JM: TO FIX]
+
+```{r}
+# First get necessary data. 
+library(dplyr)
+
+# Get the most lenient judges for generation of counterfactual outcomes
+judge_release <- data.prelim %>%
+  filter(!is.na(release_v2)) %>%
+  group_by(Judge_Name) %>%
+  summarise(
+    avg_release = mean(release_v2),
+    n_cases = n(),
+    .groups = "drop"
+  )
+
+cutoff <- quantile(judge_release$avg_release, 0.95)
+
+top_judges <- judge_release %>%
+  filter(avg_release >= cutoff) %>%
+  arrange(desc(avg_release))
+
+top_judges
+
+# Filter the data so we only have cases associated with the most lenient judges
+data.prelim_top <- data.prelim %>%
+  filter(Judge_Name %in% top_judges$Judge_Name)
+
+# Get the FTA rates by race for this group. 
+fta_rates <- data.prelim_top %>%
+  filter(release_v2 == 1) %>%
+  mutate(
+    race_group = ifelse(Race == "White", "White", "Non-White")
+  ) %>%
+  group_by(race_group) %>%
+  summarise(
+    avg_fta_rate = mean(fta_flag, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+fta_rates
+
+# Code to compute d (false positives among detained)
+
+mu <- 0.06
+
+judge_false_positive_table <- data.prelim %>%
+  group_by(Judge_Name) %>%
+  summarise(
+    n_cases = n(),
+    
+    a = mean(release_v2, na.rm = TRUE),                     # percent released
+    b = mean(fta_flag[release_v2 == 1], na.rm = TRUE),      # FTA rate among released
+    
+    .groups = "drop"
+  ) %>%
+  mutate(
+    c = 1 - a,
+    
+    q = (mu - a*b) / c,      # counterfactual FTA among detained
+    
+    d = 1 - q,               # false positives among detained
+    
+    d = pmax(pmin(d,1),0)    # force into [0,1]
+  )
+
+judge_false_positive_table
+
+# Code to get predictive error for each judge: 
+judge_false_positive_table <- judge_false_positive_table %>%
+  mutate(
+    predictive_error = a*b + c*d
+  )
+
+# Do the permutation analysis. 
+run_analysis_counterfactual <- function(data = data.prelim, ...) {
+  # Apply any number of filter conditions (all AND'ed together)
+  data <- data %>% filter(...)
+
+  # MAIN ANALYSIS
+  judge_release_table <- data %>%
+  group_by(Judge_Name) %>%
+  summarise(
+    n_cases = n(), # [2025.12.18] number of cases
+    pct_release_v1 = mean(release_v1, na.rm = TRUE) * 100,
+    pct_release_v2 = mean(release_v2, na.rm = TRUE) * 100
+  )
+  
+# judge_release_table
+
+judge_release_table <- data %>%
+  group_by(Judge_Name) %>%
+  summarise(
+    n_cases = n(), # [2025.12.18] number of cases
+    pct_release_v1 = mean(release_v1, na.rm = TRUE) * 100,
+    pct_release_v2 = mean(release_v2, na.rm = TRUE) * 100
+  ) %>%
+  mutate(
+    rank_v1 = min_rank(desc(pct_release_v1)),
+    rank_v2 = min_rank(desc(pct_release_v2))
+  )
+
+judge_release_table <- judge_release_table %>%
+  mutate(rank_diff = rank_v1 - rank_v2)
+
+# Table of predictive error rates by judge
+judge_fta_table <- judge_false_positive_table %>%
+  select(Judge_Name, predictive_error) %>%
+  mutate(
+    pct_fta = predictive_error * 100
+  ) %>%
+  select(Judge_Name, pct_fta) %>%
+  mutate(
+    rank_fta = min_rank(desc(pct_fta))
+  )
+
+judge.info.table.combined <- cbind(judge_release_table, judge_fta_table[,2:3])
+
+# Get the rank differences
+judge.info.table.combined <- judge_release_table %>%
+  inner_join(judge_fta_table, by = "Judge_Name") %>% 
+  mutate(
+    rank_diff_v1_fta = rank_v1 - rank_fta,
+    rank_diff_v2_fta = rank_v2 - rank_fta
+  )
+
+# 1) Basic vector for convenience
+rd <- judge.info.table.combined$rank_diff_v2_fta
+
+# 2) Summary stats
+v2_fta_rank_change_summary <- tibble(
+  n               = sum(!is.na(rd)),
+  mean_change     = mean(rd, na.rm = TRUE),
+  mean_abs_change = mean(abs(rd), na.rm = TRUE),
+  sd_change       = sd(rd, na.rm = TRUE),
+  median_change   = median(rd, na.rm = TRUE),
+  mad_change      = mad(rd, na.rm = TRUE),
+  min_change      = min(rd, na.rm = TRUE),
+  p10_change      = quantile(rd, 0.10, na.rm = TRUE, names = FALSE),
+  p25_change      = quantile(rd, 0.25, na.rm = TRUE, names = FALSE),
+  p75_change      = quantile(rd, 0.75, na.rm = TRUE, names = FALSE),
+  p90_change      = quantile(rd, 0.90, na.rm = TRUE, names = FALSE),
+  max_change      = max(rd, na.rm = TRUE),
+  prop_positive   = mean(rd > 0, na.rm = TRUE),
+  prop_negative   = mean(rd < 0, na.rm = TRUE),
+  prop_zero       = mean(rd == 0, na.rm = TRUE)
+)
+
+# v2_fta_rank_change_summary %>% t()
+
+
+# # 3) Top movers by absolute change
+# top_movers_v2_fta <- judge.info.table.combined %>%
+#   mutate(abs_diff_v2_fta = abs(rank_diff_v2_fta)) %>%
+#   arrange(desc(abs_diff_v2_fta)) %>%
+#   select(Judge_Name, rank_v2, rank_fta, rank_diff_v2_fta, abs_diff_v2_fta) %>%
+#   slice_head(n = 20)
+
+# top_movers_v2_fta
+
+# 4) Density plot of rank changes (v2 vs FTA)
+density.plot <- ggplot(judge.info.table.combined, aes(x = rank_diff_v2_fta)) +
+  geom_density(na.rm = TRUE) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Density of Judge Rank Changes (Release v2 vs FTA)",
+    x = "Rank Difference (rank_v2 - rank_fta)",
+    y = "Density",
+    caption = "Positive = judge ranks more release-lenient (v2) than FTA-heavy; Negative = the reverse"
+  )
+
+# Simple code for permutation test. Median.
+# Returns the median absolute rank change (|rank_v2 - rank_fta|) after permuting rank_v2
+# premtuation.test.function <- function(random.ranks) {
+#   premuted.results <- judge.info.table.combined
+#   stopifnot(length(random.ranks) == nrow(premuted.results))
+# 
+#   # replace rank_v2 with the supplied permutation
+#   premuted.results$rank_v2 <- random.ranks
+# 
+#   # recompute the v2 vs FTA rank difference
+#   premuted.results$rank_diff_v2_fta <- premuted.results$rank_v2 - premuted.results$rank_fta
+# 
+#   # return the median absolute change
+#   median(abs(premuted.results$rank_diff_v2_fta), na.rm = TRUE)
+# }
+premtuation.test.function <- function(random.ranks) {
+  permuted.results <- judge.info.table.combined
+  stopifnot(length(random.ranks) == nrow(permuted.results))
+
+  # replace rank_v2 with the supplied permutation
+  permuted.results$rank_v2 <- random.ranks
+
+  # return Kendall's tau between release-leniency rank and FTA rank
+  cor(
+    permuted.results$rank_v2,
+    permuted.results$rank_fta,
+    method = "kendall",
+    use = "complete.obs"
+  )
+}
+
+# set.seed(02138)
+
+n.sim <- 10000   # number of random permutations
+n.judges <- nrow(judge.info.table.combined)
+
+# observed statistic
+obs_stat <- median(abs(judge.info.table.combined$rank_diff_v2_fta), na.rm = TRUE)
+
+# permutation distribution
+perm_stats <- replicate(n.sim, {
+  random_perm <- sample.int(n.judges, n.judges, replace = FALSE)
+  premtuation.test.function(random_perm)
+})
+
+# summarize
+resmedian <- tibble::tibble(
+  observed = obs_stat,
+  perm_mean = median(perm_stats),
+  perm_sd = sd(perm_stats),
+  p_value_right_tail = mean(perm_stats >= obs_stat)
+)
+# resmedian
+
+# Simple code for permutation test. Mean.
+
+
+# Returns the median absolute rank change (|rank_v2 - rank_fta|) after permuting rank_v2
+# premtuation.test.function <- function(random.ranks) {
+#   premuted.results <- judge.info.table.combined
+#   stopifnot(length(random.ranks) == nrow(premuted.results))
+# 
+#   # replace rank_v2 with the supplied permutation
+#   premuted.results$rank_v2 <- random.ranks
+# 
+#   # recompute the v2 vs FTA rank difference
+#   premuted.results$rank_diff_v2_fta <- premuted.results$rank_v2 - premuted.results$rank_fta
+# 
+#   # return the median absolute change
+#   mean(abs(premuted.results$rank_diff_v2_fta), na.rm = TRUE)
+# }
+premtuation.test.function <- function(random.ranks) {
+  permuted.results <- judge.info.table.combined
+  stopifnot(length(random.ranks) == nrow(permuted.results))
+
+  # replace rank_v2 with the supplied permutation
+  permuted.results$rank_v2 <- random.ranks
+
+  # return Kendall's tau between release-leniency rank and FTA rank
+  cor(
+    permuted.results$rank_v2,
+    permuted.results$rank_fta,
+    method = "kendall",
+    use = "complete.obs"
+  )
+}
+
+# set.seed(02138)
+
+n.sim <- 10000   # number of random permutations
+n.judges <- nrow(judge.info.table.combined)
+
+# observed statistic
+obs_stat <- mean(abs(judge.info.table.combined$rank_diff_v2_fta), na.rm = TRUE)
+
+# permutation distribution
+perm_stats <- replicate(n.sim, {
+  random_perm <- sample.int(n.judges, n.judges, replace = FALSE)
+  premtuation.test.function(random_perm)
+})
+
+# summarize
+resmean <- tibble::tibble(
+  n.judges = n.judges,
+  observed = obs_stat,
+  perm_mean = mean(perm_stats),
+  perm_sd = sd(perm_stats),
+  # p_value_right_tail = mean(perm_stats >= obs_stat)
+  p_value_right_tail = 1 - mean(perm_stats >= obs_stat)
+)
+# resmean 
+
+
+summary.stats <- judge.info.table.combined %>%
+  summarise(
+    pct_fta_p25 = quantile(pct_fta, 0.25, na.rm = TRUE),
+    pct_fta_median = median(pct_fta, na.rm = TRUE),
+    pct_fta_p75 = quantile(pct_fta, 0.75, na.rm = TRUE),
+    
+    pct_release_v2_p25 = quantile(pct_release_v2, 0.25, na.rm = TRUE),
+    pct_release_v2_median = median(pct_release_v2, na.rm = TRUE),
+    pct_release_v2_p75 = quantile(pct_release_v2, 0.75, na.rm = TRUE),
+    
+    kendall_tau = cor(pct_release_v2, pct_fta, method = "kendall", use = "complete.obs") # 202.03.07 adding kendall tau
+
+  )
+
+# summary.stats
+
+results <- list(judge.info.table.combined = judge.info.table.combined, v2_fta_rank_change_summary = v2_fta_rank_change_summary, 
+                # top_movers_v2_fta = top_movers_v2_fta, 
+                resmean = resmean, summary.stats = summary.stats, perm_stats = perm_stats, density.plot = density.plot)
+  # -----------------------------------
+
+  return(results)
+}
+
+# Conduct the Analysis
+# Overall sample
+results.overall <- run_analysis_counterfactual(data = data.prelim, TRUE)
+
+# Print the result
+# Define the list of result objects
+all_results <- list(
+  Overall = results.overall
+  # ,
+  # White = results.white,
+  # `Non-White` = results.nonwhite,
+  # Misdemeanor = results.mis,
+  # Felony = results.fel,
+  # `With Rep.` = results.rep,
+  # `No Rep.` = results.norep
+)
+
+# Loop and print the quantities for each
+for (name in names(all_results)) {
+  res <- all_results[[name]]
+  
+  if (!is.null(res$resmean)) {
+    cat("\n----", name, "----\n")
+    cat("p-value:", signif(res$resmean$p_value_right_tail, 3), "\n")
+    cat("Avg. Abs. Rank Diff.:", round(res$resmean$observed, 2), "\n")
+    cat("Mean Under Null:", round(res$resmean$perm_mean, 2), "\n")
+    cat("SD Under Null:", round(res$resmean$perm_sd, 2), "\n")
+    
+    rho <- cor(
+      res$judge.info.table.combined$rank_v2,
+      res$judge.info.table.combined$rank_fta,
+      method = "spearman",
+      use = "complete.obs"
+    )
+    cat("Spearman's rho:", round(rho, 3), "\n")
+    # NEW: print Kendall tau
+    cat("Kendall's tau:", round(res$summary.stats$kendall_tau, 3), "\n")
+    cat("# Judges:", res$resmean$n.judges, "\n")
+  }
+}
+```
+
+# Bootstrap diagnostics [optional]
+
+```{r eval=FALSE, include=FALSE}
+library(dplyr)
+# --- core bootstrap function for ONE judge ---
+bootstrap_one_judge <- function(judge_name, data, B = 100, prop = 0.6) {
+  
+  # subset data for this judge
+  df_judge <- data %>%
+    filter(Judge_Name == judge_name)
+  
+  n <- nrow(df_judge)
+  
+  # handle edge case
+  if (n == 0) {
+    return(rep(NA, 2 * B))
+  }
+  
+  sample_size <- ceiling(prop * n)
+  
+  # storage: strictness + reappearance for each bootstrap
+  out <- numeric(2 * B)
+  
+  for (b in seq_len(B)) {
+    
+    # bootstrap sample with replacement
+    idx <- sample.int(n, size = sample_size, replace = TRUE)
+    df_boot <- df_judge[idx, ]
+    
+    # --- strictness (release rate) ---
+    strictness <- mean(df_boot$release_v1, na.rm = TRUE)
+    
+    # --- reappearance ---
+    # assuming fta_flag = 1 means FTA (bad), 0 means reappeared
+    # so reappearance rate = 1 - mean(fta_flag)
+    reappearance <- 1 - mean(df_boot$fta_flag, na.rm = TRUE)
+    
+    # store
+    out[2*b - 1] <- strictness
+    out[2*b]     <- reappearance
+  }
+  
+  return(out)
+}
+
+
+# --- wrapper over all judges ---
+bootstrap_all_judges <- function(data, B = 100, prop = 0.6) {
+  
+  judges <- unique(data$Judge_Name)
+  
+  # apply bootstrap to each judge
+  res_list <- lapply(judges, function(j) {
+    bootstrap_one_judge(j, data, B = B, prop = prop)
+  })
+  
+  # combine into matrix
+  res_mat <- do.call(rbind, res_list)
+  
+  # name rows
+  rownames(res_mat) <- judges
+  
+  # name columns: strict_1, reappear_1, strict_2, reappear_2, ...
+  col_names <- unlist(lapply(seq_len(B), function(b) {
+    c(paste0("strict_", b), paste0("reappear_", b))
+  }))
+  
+  colnames(res_mat) <- col_names
+  
+  # convert to data frame and add judge name column
+  res_df <- as.data.frame(res_mat)
+  res_df$Judge_Name <- judges
+  
+  # move Judge_Name to front
+  res_df <- res_df %>%
+    select(Judge_Name, everything())
+  
+  return(res_df)
+}
+
+
+# --- RUN IT ---
+bootstrap_results <- bootstrap_all_judges(
+  data = data.prelim,
+  B = 100,     # number of bootstrap draws
+  prop = 0.6   # 60% sampling
+)
+
+
+# Sanity check for bootstrap
+# --- identify bootstrap columns ---
+strict_cols <- grep("^strict_", names(bootstrap_results))
+reappear_cols <- grep("^reappear_", names(bootstrap_results))
+
+# --- compute bootstrap means ---
+bootstrap_summary <- data.frame(
+  Judge_Name = bootstrap_results$Judge_Name,
+  boot_mean_strict = rowMeans(bootstrap_results[, strict_cols], na.rm = TRUE),
+  boot_mean_reappear = rowMeans(bootstrap_results[, reappear_cols], na.rm = TRUE)
+)
+
+# --- true values from original table ---
+true_values <- judge.info.table.combined %>%
+  transmute(
+    Judge_Name,
+    true_strict = pct_release_v1 / 100,
+    true_reappear = 1 - (pct_fta / 100)
+  )
+
+# --- merge and compute differences ---
+comparison <- bootstrap_summary %>%
+  left_join(true_values, by = "Judge_Name") %>%
+  mutate(
+    diff_strict = boot_mean_strict - true_strict,
+    diff_reappear = boot_mean_reappear - true_reappear
+  )
+
+# --- summaries ---
+print(summary(comparison$diff_strict))
+print(summary(comparison$diff_reappear))
+
+print(mean(abs(comparison$diff_strict), na.rm = TRUE))
+print(mean(abs(comparison$diff_reappear), na.rm = TRUE))
+
+# --- worst discrepancies ---
+print(
+  comparison %>%
+    arrange(desc(abs(diff_strict))) %>%
+    select(Judge_Name, diff_strict) %>%
+    head()
+)
+
+print(
+  comparison %>%
+    arrange(desc(abs(diff_reappear))) %>%
+    select(Judge_Name, diff_reappear) %>%
+    head()
+)
+
+# --- plots ---
+par(mfrow = c(1,2))
+
+plot(comparison$true_strict, comparison$boot_mean_strict,
+     main = "Strictness: True vs Bootstrap",
+     xlab = "True", ylab = "Bootstrap Mean")
+abline(0, 1, col = "red")
+
+plot(comparison$true_reappear, comparison$boot_mean_reappear,
+     main = "Reappearance: True vs Bootstrap",
+     xlab = "True", ylab = "Bootstrap Mean")
+abline(0, 1, col = "red")
+
+# --- histograms of bias ---
+par(mfrow = c(1,2))
+
+hist(comparison$diff_strict, main = "Bias in Strictness", breaks = 30)
+hist(comparison$diff_reappear, main = "Bias in Reappearance", breaks = 30)
+
+```
+
+# Functional approach to analysis [Kendall Tau] - Table 3 and A.10
+
+```{r}
+run_analysis <- function(data = data.prelim, ...) {
+  # Apply any number of filter conditions (all AND'ed together)
+  data <- data %>% filter(...)
+
+  # MAIN ANALYSIS
+  judge_release_table <- data %>%
+  group_by(Judge_Name) %>%
+  summarise(
+    n_cases = n(), # [2025.12.18] number of cases
+    pct_release_v1 = mean(release_v1, na.rm = TRUE) * 100,
+    pct_release_v2 = mean(release_v2, na.rm = TRUE) * 100
+  )
+  
+# judge_release_table
+
+judge_release_table <- data %>%
+  group_by(Judge_Name) %>%
+  summarise(
+    n_cases = n(), # [2025.12.18] number of cases
+    pct_release_v1 = mean(release_v1, na.rm = TRUE) * 100,
+    pct_release_v2 = mean(release_v2, na.rm = TRUE) * 100
+  ) %>%
+  mutate(
+    rank_v1 = min_rank(desc(pct_release_v1)),
+    rank_v2 = min_rank(desc(pct_release_v2))
+  )
+
+judge_release_table <- judge_release_table %>%
+  mutate(rank_diff = rank_v1 - rank_v2)
+
+# judge_release_table
+
+# Table of FTA rates by judge
+judge_fta_table <- data %>%
+  group_by(Judge_Name) %>%
+  summarise(
+    pct_fta = mean(fta_flag, na.rm = TRUE) * 100
+  ) %>%
+  mutate(
+    rank_fta = min_rank(desc(pct_fta))
+  )
+
+# judge_fta_table
+
+judge.info.table.combined <- cbind(judge_release_table, judge_fta_table[,2:3])
+
+# judge.info.table.combined
+
+
+# Get the rank differences
+judge.info.table.combined <- judge_release_table %>%
+  inner_join(judge_fta_table, by = "Judge_Name") %>% 
+  mutate(
+    rank_diff_v1_fta = rank_v1 - rank_fta,
+    rank_diff_v2_fta = rank_v2 - rank_fta
+  )
+
+# 1) Basic vector for convenience
+rd <- judge.info.table.combined$rank_diff_v2_fta
+
+# 2) Summary stats
+v2_fta_rank_change_summary <- tibble(
+  n               = sum(!is.na(rd)),
+  mean_change     = mean(rd, na.rm = TRUE),
+  mean_abs_change = mean(abs(rd), na.rm = TRUE),
+  sd_change       = sd(rd, na.rm = TRUE),
+  median_change   = median(rd, na.rm = TRUE),
+  mad_change      = mad(rd, na.rm = TRUE),
+  min_change      = min(rd, na.rm = TRUE),
+  p10_change      = quantile(rd, 0.10, na.rm = TRUE, names = FALSE),
+  p25_change      = quantile(rd, 0.25, na.rm = TRUE, names = FALSE),
+  p75_change      = quantile(rd, 0.75, na.rm = TRUE, names = FALSE),
+  p90_change      = quantile(rd, 0.90, na.rm = TRUE, names = FALSE),
+  max_change      = max(rd, na.rm = TRUE),
+  prop_positive   = mean(rd > 0, na.rm = TRUE),
+  prop_negative   = mean(rd < 0, na.rm = TRUE),
+  prop_zero       = mean(rd == 0, na.rm = TRUE)
+)
+
+# v2_fta_rank_change_summary %>% t()
+
+
+# # 3) Top movers by absolute change
+# top_movers_v2_fta <- judge.info.table.combined %>%
+#   mutate(abs_diff_v2_fta = abs(rank_diff_v2_fta)) %>%
+#   arrange(desc(abs_diff_v2_fta)) %>%
+#   select(Judge_Name, rank_v2, rank_fta, rank_diff_v2_fta, abs_diff_v2_fta) %>%
+#   slice_head(n = 20)
+
+# top_movers_v2_fta
+
+# 4) Density plot of rank changes (v2 vs FTA)
+density.plot <- ggplot(judge.info.table.combined, aes(x = rank_diff_v2_fta)) +
+  geom_density(na.rm = TRUE) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Density of Judge Rank Changes (Release v2 vs FTA)",
+    x = "Rank Difference (rank_v2 - rank_fta)",
+    y = "Density",
+    caption = "Positive = judge ranks more release-lenient (v2) than FTA-heavy; Negative = the reverse"
+  )
+
+# Simple code for permutation test. Median.
+# Returns the median absolute rank change (|rank_v2 - rank_fta|) after permuting rank_v2
+# premtuation.test.function <- function(random.ranks) {
+#   premuted.results <- judge.info.table.combined
+#   stopifnot(length(random.ranks) == nrow(premuted.results))
+# 
+#   # replace rank_v2 with the supplied permutation
+#   premuted.results$rank_v2 <- random.ranks
+# 
+#   # recompute the v2 vs FTA rank difference
+#   premuted.results$rank_diff_v2_fta <- premuted.results$rank_v2 - premuted.results$rank_fta
+# 
+#   # return the median absolute change
+#   median(abs(premuted.results$rank_diff_v2_fta), na.rm = TRUE)
+# }
+premtuation.test.function <- function(random.ranks) {
+  permuted.results <- judge.info.table.combined
+  stopifnot(length(random.ranks) == nrow(permuted.results))
+
+  # replace rank_v2 with the supplied permutation
+  permuted.results$rank_v2 <- random.ranks
+
+  # return Kendall's tau between release-leniency rank and FTA rank
+  cor(
+    permuted.results$rank_v2,
+    permuted.results$rank_fta,
+    method = "kendall",
+    use = "complete.obs"
+  )
+}
+
+# set.seed(02138)
+
+n.sim <- 5000   # number of random permutations
+n.judges <- nrow(judge.info.table.combined)
+
+# observed statistic
+obs_stat <- median(abs(judge.info.table.combined$rank_diff_v2_fta), na.rm = TRUE) %>% abs
+
+# permutation distribution
+perm_stats <- replicate(n.sim, {
+  random_perm <- sample.int(n.judges, n.judges, replace = FALSE)
+  premtuation.test.function(random_perm)
+}) %>% abs
+
+# summarize
+resmedian <- tibble::tibble(
+  observed = obs_stat,
+  perm_mean = median(perm_stats),
+  perm_sd = sd(perm_stats),
+  p_value_right_tail = mean(perm_stats >= obs_stat)
+)
+# resmedian
+
+# Simple code for permutation test. Mean.
+# # Returns the median absolute rank change (|rank_v2 - rank_fta|) after permuting rank_v2
+# premtuation.test.function <- function(random.ranks) {
+#   premuted.results <- judge.info.table.combined
+#   stopifnot(length(random.ranks) == nrow(premuted.results))
+# 
+#   # replace rank_v2 with the supplied permutation
+#   premuted.results$rank_v2 <- random.ranks
+# 
+#   # recompute the v2 vs FTA rank difference
+#   premuted.results$rank_diff_v2_fta <- premuted.results$rank_v2 - premuted.results$rank_fta
+# 
+#   # return the median absolute change
+#   mean(abs(premuted.results$rank_diff_v2_fta), na.rm = TRUE)
+# }
+# Returns Kendall's tau between rank_v2 and rank_fta after permuting rank_v2
+premtuation.test.function <- function(random.ranks) {
+  permuted.results <- judge.info.table.combined
+  stopifnot(length(random.ranks) == nrow(permuted.results))
+
+  # replace rank_v2 with the supplied permutation
+  permuted.results$rank_v2 <- random.ranks
+
+  # compute Kendall's tau
+  cor(
+    permuted.results$rank_v2,
+    permuted.results$rank_fta,
+    method = "kendall",
+    use = "complete.obs"
+  )
+}
+
+# set.seed(02138)
+
+n.sim <- 5000   # number of random permutations
+n.judges <- nrow(judge.info.table.combined)
+
+# observed statistic
+obs_stat <- cor(
+  judge.info.table.combined$rank_v2,
+  judge.info.table.combined$rank_fta,
+  method = "kendall",
+  use = "complete.obs"
+) %>% abs
+
+# permutation distribution
+perm_stats <- replicate(n.sim, {
+  random_perm <- sample.int(n.judges, n.judges, replace = FALSE)
+  premtuation.test.function(random_perm)
+}) %>% abs
+
+# summarize
+resmean <- tibble::tibble(
+  n.judges = n.judges,
+  observed = obs_stat,
+  perm_mean = mean(perm_stats),
+  perm_sd = sd(perm_stats),
+  # p_value_right_tail = mean(perm_stats >= obs_stat)
+  p_value_right_tail = mean(perm_stats >= obs_stat)
+)
+# resmean 
+
+
+summary.stats <- judge.info.table.combined %>%
+  summarise(
+    pct_fta_p25 = quantile(pct_fta, 0.25, na.rm = TRUE),
+    pct_fta_median = median(pct_fta, na.rm = TRUE),
+    pct_fta_p75 = quantile(pct_fta, 0.75, na.rm = TRUE),
+    
+    pct_release_v2_p25 = quantile(pct_release_v2, 0.25, na.rm = TRUE),
+    pct_release_v2_median = median(pct_release_v2, na.rm = TRUE),
+    pct_release_v2_p75 = quantile(pct_release_v2, 0.75, na.rm = TRUE),
+    
+    kendall_tau = cor(pct_release_v2, pct_fta, method = "kendall", use = "complete.obs") # 202.03.07 adding kendall tau
+
+  )
+
+# summary.stats
+
+results <- list(judge.info.table.combined = judge.info.table.combined, v2_fta_rank_change_summary = v2_fta_rank_change_summary, 
+                # top_movers_v2_fta = top_movers_v2_fta, 
+                resmean = resmean, summary.stats = summary.stats, perm_stats = perm_stats, density.plot = density.plot)
+  # -----------------------------------
+
+  return(results)
+}
+```
+
+
+# Conduct Analysis
+
+```{r}
+# Set seed 
+set.seed(02138)
+
+# Overall sample
+results.overall <- run_analysis(data = data.prelim, TRUE)
+# 
+# # Race
+# results.white    <- run_analysis(data = data.prelim, Race == "White")
+# results.nonwhite <- run_analysis(data = data.prelim, Race != "White" & Race != "Unknown")
+# 
+# # Severity of Charge
+# results.mis <- run_analysis(data = data.prelim, Top_Severity_at_Arraign == "Misdemeanor")
+# results.fel <- run_analysis(data = data.prelim, Top_Severity_at_Arraign == "Felony")
+# 
+# # Representation
+# results.rep    <- run_analysis(data = data.prelim, Representation_at_Securing_Order == "Y")
+# results.norep  <- run_analysis(data = data.prelim, Representation_at_Securing_Order == "N")
+
+```
+
+
+# Print all  analyses
+
+```{r}
+# Define the list of result objects
+all_results <- list(
+  Overall = results.overall
+  # ,
+  # White = results.white,
+  # `Non-White` = results.nonwhite,
+  # Misdemeanor = results.mis,
+  # Felony = results.fel,
+  # `With Rep.` = results.rep,
+  # `No Rep.` = results.norep
+)
+
+# Loop and print the quantities for each
+for (name in names(all_results)) {
+  res <- all_results[[name]]
+  
+  if (!is.null(res$resmean)) {
+    cat("\n----", name, "----\n")
+    cat("p-value:", signif(res$resmean$p_value_right_tail, 3), "\n")
+    cat("Avg. Abs. Rank Diff.:", round(res$resmean$observed, 2), "\n")
+    cat("Mean Under Null:", round(res$resmean$perm_mean, 2), "\n")
+    cat("SD Under Null:", round(res$resmean$perm_sd, 2), "\n")
+    
+    rho <- cor(
+      res$judge.info.table.combined$rank_v2,
+      res$judge.info.table.combined$rank_fta,
+      method = "spearman",
+      use = "complete.obs"
+    )
+    cat("Spearman's rho:", round(rho, 3), "\n")
+    # NEW: print Kendall tau
+    cat("Kendall's tau:", round(res$summary.stats$kendall_tau, 3), "\n")
+    cat("# Judges:", res$resmean$n.judges, "\n")
+  }
+}
+```
+
+# Basic linear regressions - A.3
+
+```{r}
+run_analysis_ols <- function(data = data.prelim, ...) {
+  # Apply any number of filter conditions (all AND'ed together)
+  data <- data %>% filter(...)
+
+  # MAIN ANALYSIS
+  judge_release_table <- data %>%
+  group_by(Judge_Name) %>%
+  summarise(
+    pct_release_v1 = mean(release_v1, na.rm = TRUE) * 100,
+    pct_release_v2 = mean(release_v2, na.rm = TRUE) * 100
+  )
+
+# judge_release_table
+
+judge_release_table <- data %>%
+  group_by(Judge_Name) %>%
+  summarise(
+    pct_release_v1 = mean(release_v1, na.rm = TRUE) * 100,
+    pct_release_v2 = mean(release_v2, na.rm = TRUE) * 100
+  ) %>%
+  mutate(
+    rank_v1 = min_rank(desc(pct_release_v1)),
+    rank_v2 = min_rank(desc(pct_release_v2))
+  )
+
+judge_release_table <- judge_release_table %>%
+  mutate(rank_diff = rank_v1 - rank_v2)
+
+# judge_release_table
+
+# Table of FTA rates by judge
+judge_fta_table <- data %>%
+  group_by(Judge_Name) %>%
+  summarise(
+    pct_fta = mean(fta_flag, na.rm = TRUE) * 100
+  ) %>%
+  mutate(
+    rank_fta = min_rank(desc(pct_fta))
+  )
+
+# judge_fta_table
+
+judge.info.table.combined <- cbind(judge_release_table, judge_fta_table[,2:3])
+
+# judge.info.table.combined
+
+  # simple linear regression: pct_fta ~ pct_release_v2
+  model <- lm(pct_fta ~ pct_release_v2, data = judge.info.table.combined)
+  
+  # extract key results
+  summary_model <- summary(model)
+  coef_table <- summary_model$coefficients
+  
+  # organize outputs
+  results <- list(
+    coefficients = coef_table,
+    intercept = coef(model)[1],
+    slope = coef(model)[2],
+    r_squared = summary_model$r.squared,
+    adj_r_squared = summary_model$adj.r.squared,
+    p_value = coef_table[2, 4],
+    model_summary = summary_model
+  )
+  
+  return(results)
+  }
+
+```
+
+## conuct the basic linear regression analysis
+
+```{r}
+# Overall sample
+results.overall.ols <- run_analysis_ols(data = data.prelim, TRUE)
+
+# Race
+results.white.ols    <- run_analysis_ols(data = data.prelim, Race == "White")
+results.nonwhite.ols <- run_analysis_ols(data = data.prelim, Race != "White" & Race != "Unknown")
+
+# Severity of Charge
+results.mis.ols <- run_analysis_ols(data = data.prelim, Top_Severity_at_Arraign == "Misdemeanor")
+results.fel.ols <- run_analysis_ols(data = data.prelim, Top_Severity_at_Arraign == "Felony")
+
+# Representation
+results.rep.ols    <- run_analysis_ols(data = data.prelim, Representation_at_Securing_Order == "Y")
+results.norep.ols  <- run_analysis_ols(data = data.prelim, Representation_at_Securing_Order == "N")
+
+# Bundle all OLS results into one named list
+all_ols_results <- list(
+  overall  = results.overall.ols,
+  white    = results.white.ols,
+  nonwhite = results.nonwhite.ols,
+  mis      = results.mis.ols,
+  fel      = results.fel.ols,
+  rep      = results.rep.ols,
+  norep    = results.norep.ols
+)
+
+```
+
+## Print the results
+
+```{r}
+# Function to safely extract coefficient info (fixed version)
+extract_ols_info <- function(res) {
+  if (is.null(res$coefficients)) return(NULL)
+  slope <- res$coefficients["pct_release_v2", "Estimate"]
+  se_slope <- res$coefficients["pct_release_v2", "Std. Error"]
+  intercept <- res$coefficients["(Intercept)", "Estimate"]
+  se_intercept <- res$coefficients["(Intercept)", "Std. Error"]
+  r2 <- res$r_squared
+  adjr2 <- res$adj_r_squared
+  
+  # Extract n from model_summary if it exists, else set NA
+  n <- tryCatch({
+    as.numeric(gsub(".* on ([0-9]+) degrees of freedom.*", "\\1", 
+                    capture.output(res$model_summary)[grep("degrees of freedom", capture.output(res$model_summary))][1])) + 2
+  }, error = function(e) NA)
+  
+  return(list(
+    slope = slope,
+    se_slope = se_slope,
+    intercept = intercept,
+    se_intercept = se_intercept,
+    r2 = r2,
+    adjr2 = adjr2,
+    n = n
+  ))
+}
+
+# Loop through and print each
+for (name in names(all_ols_results)) {
+  res <- extract_ols_info(all_ols_results[[name]])
+  if (!is.null(res)) {
+    cat("\n----", name, "----\n")
+    cat("Slope:", round(res$slope, 3), "\n")
+    cat("SE (slope):", round(res$se_slope, 3), "\n")
+    cat("Intercept:", round(res$intercept, 3), "\n")
+    cat("SE (intercept):", round(res$se_intercept, 3), "\n")
+    cat("R²:", round(res$r2, 3), "\n")
+    cat("Adj. R²:", round(res$adjr2, 3), "\n")
+    cat("Judges:", res$n, "\n")
+  }
+}
+
+```
+
+# logit A.4. 
+
+```{r}
+run_analysis_logit <- function(data = data.prelim, ...) {
+
+  # Apply filters
+  data <- data %>% filter(...)
+
+  # Compute judge strictness (release rate)
+  judge_release_table <- data %>%
+    group_by(Judge_Name) %>%
+    summarise(
+      pct_release_v2 = mean(release_v2, na.rm = TRUE) * 100
+    )
+
+  # Merge strictness back to individual observations
+  data <- data %>%
+    left_join(judge_release_table, by = "Judge_Name")
+
+  # Logistic regression: FTA ~ judge strictness
+  model <- glm(fta_flag ~ pct_release_v2,
+               data = data,
+               family = binomial(link = "logit"))
+
+  # summary_model <- summary(model)
+  # coef_table <- summary_model$coefficients
+
+
+cluster_se <- vcovCL(model, cluster = data$Judge_Name)
+coef_table <- coeftest(model, vcov = cluster_se)
+
+summary_model <- summary(model)
+
+  # results <- list(
+  #   coefficients = coef_table,
+  #   intercept = coef(model)[1],
+  #   slope = coef(model)[2],
+  #   p_value = coef_table[2,4],
+  #   model_summary = summary_model
+  # )
+
+results <- list(
+  coefficients = coef_table,
+  intercept = coef(model)[1],
+  slope = coef(model)[2],
+  p_value = coef_table[2,4],
+  n = nobs(model),
+  model_summary = summary_model
+)
+
+  return(results)
+}
+```
+
+
+## conduct basic probit and print results
+
+```{r}
+# conduct the basic logit regression analysis
+
+# Overall sample
+results.overall.logit <- run_analysis_logit(data = data.prelim, TRUE)
+
+# Race
+results.white.logit    <- run_analysis_logit(data = data.prelim, Race == "White")
+results.nonwhite.logit <- run_analysis_logit(data = data.prelim, Race != "White" & Race != "Unknown")
+
+# Severity of Charge
+results.mis.logit <- run_analysis_logit(data = data.prelim, Top_Severity_at_Arraign == "Misdemeanor")
+results.fel.logit <- run_analysis_logit(data = data.prelim, Top_Severity_at_Arraign == "Felony")
+
+# Representation
+results.rep.logit    <- run_analysis_logit(data = data.prelim, Representation_at_Securing_Order == "Y")
+results.norep.logit  <- run_analysis_logit(data = data.prelim, Representation_at_Securing_Order == "N")
+
+# Bundle all logit results
+all_logit_results <- list(
+  overall  = results.overall.logit,
+  white    = results.white.logit,
+  nonwhite = results.nonwhite.logit,
+  mis      = results.mis.logit,
+  fel      = results.fel.logit,
+  rep      = results.rep.logit,
+  norep    = results.norep.logit
+)
+
+extract_logit_info <- function(res) {
+
+  if (is.null(res$coefficients)) return(NULL)
+
+  slope <- res$coefficients["pct_release_v2", "Estimate"]
+  se_slope <- res$coefficients["pct_release_v2", "Std. Error"]
+
+  intercept <- res$coefficients["(Intercept)", "Estimate"]
+  se_intercept <- res$coefficients["(Intercept)", "Std. Error"]
+
+  p_value <- res$coefficients["pct_release_v2", "Pr(>|z|)"]
+
+  n <- res$n   # <-- use the stored sample size
+
+  list(
+    slope = slope,
+    se_slope = se_slope,
+    intercept = intercept,
+    se_intercept = se_intercept,
+    p_value = p_value,
+    n = n
+  )
+}
+
+for (name in names(all_logit_results)) {
+
+  res <- extract_logit_info(all_logit_results[[name]])
+
+  if (!is.null(res)) {
+    cat("\n----", name, "----\n")
+    cat("Slope (log-odds):", round(res$slope, 3), "\n")
+    cat("SE (slope):", round(res$se_slope, 3), "\n")
+    cat("Intercept:", round(res$intercept, 3), "\n")
+    cat("SE (intercept):", round(res$se_intercept, 3), "\n")
+    cat("p-value:", round(res$p_value, 4), "\n")
+    cat("Observations:", res$n, "\n")
+  }
+
+}
+```
+
+
+# Probit A.5
+
+```{r}
+run_analysis_probit <- function(data = data.prelim, ...) {
+
+  # Apply filters
+  data <- data %>% filter(...)
+
+  # Compute judge strictness (release rate)
+  judge_release_table <- data %>%
+    group_by(Judge_Name) %>%
+    summarise(
+      pct_release_v2 = mean(release_v2, na.rm = TRUE) * 100
+    )
+
+  # Merge strictness back to individual observations
+  data <- data %>%
+    left_join(judge_release_table, by = "Judge_Name")
+
+  # Probit regression: FTA ~ judge strictness
+  model <- glm(
+    fta_flag ~ pct_release_v2,
+    data = data,
+    family = binomial(link = "probit")
+  )
+
+  summary_model <- summary(model)
+  coef_table <- summary_model$coefficients
+
+  results <- list(
+    coefficients = coef_table,
+    intercept = coef(model)[1],
+    slope = coef(model)[2],
+    p_value = coef_table[2,4],
+    model_summary = summary_model
+  )
+
+  return(results)
+}
+```
+
+
+## Run and print
+
+```{r}
+# conduct the basic probit regression analysis
+
+# Overall sample
+results.overall.probit <- run_analysis_probit(data = data.prelim, TRUE)
+
+# Race
+results.white.probit    <- run_analysis_probit(data = data.prelim, Race == "White")
+results.nonwhite.probit <- run_analysis_probit(data = data.prelim, Race != "White" & Race != "Unknown")
+
+# Severity of Charge
+results.mis.probit <- run_analysis_probit(data = data.prelim, Top_Severity_at_Arraign == "Misdemeanor")
+results.fel.probit <- run_analysis_probit(data = data.prelim, Top_Severity_at_Arraign == "Felony")
+
+# Representation
+results.rep.probit    <- run_analysis_probit(data = data.prelim, Representation_at_Securing_Order == "Y")
+results.norep.probit  <- run_analysis_probit(data = data.prelim, Representation_at_Securing_Order == "N")
+
+# Bundle all probit results
+all_probit_results <- list(
+  overall  = results.overall.probit,
+  white    = results.white.probit,
+  nonwhite = results.nonwhite.probit,
+  mis      = results.mis.probit,
+  fel      = results.fel.probit,
+  rep      = results.rep.probit,
+  norep    = results.norep.probit
+)
+
+all_probit_results
+```
+
+# pearson - A.6
+
+```{r}
+run_analysis_correlation <- function(data = data.prelim, ...) {
+  
+  # Apply filters
+  data <- data %>% filter(...)
+  
+  # Judge strictness (release rates)
+  judge_release_table <- data %>%
+    group_by(Judge_Name) %>%
+    summarise(
+      pct_release_v2 = mean(release_v2, na.rm = TRUE) * 100
+    )
+  
+  # Judge FTA rates
+  judge_fta_table <- data %>%
+    group_by(Judge_Name) %>%
+    summarise(
+      pct_fta = mean(fta_flag, na.rm = TRUE) * 100
+    )
+  
+  # Merge tables
+  judge.info.table.combined <- cbind(judge_release_table, judge_fta_table[,2])
+  colnames(judge.info.table.combined)[3] <- "pct_fta"
+  
+  # Convert to re-appearance rate
+  judge.info.table.combined <- judge.info.table.combined %>%
+    mutate(pct_reappearance = 100 - pct_fta)
+  
+  # Pearson correlation test
+  corr_test <- cor.test(
+    judge.info.table.combined$pct_release_v2,
+    judge.info.table.combined$pct_reappearance,
+    method = "pearson"
+  )
+  
+  results <- list(
+    correlation = corr_test$estimate,
+    p_value = corr_test$p.value,
+    conf_int = corr_test$conf.int,
+    test_object = corr_test
+  )
+  
+  return(results)
+}
+```
+
+## run and print
+
+```{r}
+# conduct the Pearson correlation analysis
+
+# Overall sample
+results.overall.corr <- run_analysis_correlation(data = data.prelim, TRUE)
+
+# Race
+results.white.corr    <- run_analysis_correlation(data = data.prelim, Race == "White")
+results.nonwhite.corr <- run_analysis_correlation(data = data.prelim, Race != "White" & Race != "Unknown")
+
+# Severity of Charge
+results.mis.corr <- run_analysis_correlation(data = data.prelim, Top_Severity_at_Arraign == "Misdemeanor")
+results.fel.corr <- run_analysis_correlation(data = data.prelim, Top_Severity_at_Arraign == "Felony")
+
+# Representation
+results.rep.corr    <- run_analysis_correlation(data = data.prelim, Representation_at_Securing_Order == "Y")
+results.norep.corr  <- run_analysis_correlation(data = data.prelim, Representation_at_Securing_Order == "N")
+
+# Bundle all correlation results
+all_corr_results <- list(
+  overall  = results.overall.corr,
+  white    = results.white.corr,
+  nonwhite = results.nonwhite.corr,
+  mis      = results.mis.corr,
+  fel      = results.fel.corr,
+  rep      = results.rep.corr,
+  norep    = results.norep.corr
+)
+all_corr_results
+```
+
+# Code for partial ordering analysis. 
+
+# get the data
+
+```{r}
+# Sort the judge info table by number of cases (ascending)
+sorted_table <- results.overall$judge.info.table.combined %>%
+  arrange(n_cases)
+
+# Display the first few rows to verify
+
+top10_judges <- results.overall$judge.info.table.combined %>%
+  arrange(desc(n_cases)) %>%
+  # slice(1:5) # For top 5 
+  # slice(1:10) #  For top 10 
+# slice(1:20) #  For top 20
+ slice(1:nrow(results.overall$judge.info.table.combined)) # For everyone
+```
+
+# Get the partial orderings
+
+```{r}
+# Constructing the rank-based partial order graph
+library(dplyr)
+library(tidyr)
+
+# Extract the relevant columns
+df <- top10_judges %>%
+  dplyr::select(Judge_Name, s_j = rank_v2, f_j = rank_fta) %>%
+  tidyr::drop_na()
+
+
+# Initialize empty edge list
+edges <- data.frame(from = character(), to = character(), stringsAsFactors = FALSE)
+
+# Compare each ordered pair of judges
+for (k in 1:nrow(df)) {
+  for (j in 1:nrow(df)) {
+    if (k != j) {
+      # Apply dominance rule: s_k ≥ s_j and f_k ≤ f_j, with at least one strict inequality
+      if ((df$s_j[k] >= df$s_j[j]) &&
+          (df$f_j[k] <= df$f_j[j]) &&
+          ((df$s_j[k] != df$s_j[j]) || (df$f_j[k] != df$f_j[j]))) {
+        edges <- rbind(edges, data.frame(from = df$Judge_Name[k],
+                                         to   = df$Judge_Name[j],
+                                         stringsAsFactors = FALSE))
+      }
+    }
+  }
+}
+
+# Optional: remove transitive edges (to produce a Hasse diagram)
+# You can skip this step if you just need the full dominance relation
+# library(igraph)
+# g <- graph_from_data_frame(edges, vertices = df$Judge_Name, directed = TRUE)
+# edges <- as_data_frame(simplify(g, remove.multiple = TRUE, remove.loops = TRUE))
+
+# Return the sets of vertices and edges
+vertices <- df$Judge_Name
+dominance_graph <- list(vertices = vertices, edges = edges)
+
+# Inspect
+dominance_graph$edges
+
+```
+
+N.B.: "from" is who's worse. "to" is who's better. 
+
+# Accounting for uncertainty.
+
+"For all judge A B pairs, if judge A is ranked higher than judge B, how much better does judge B's FTA rate have to be to be equal to that of judge A? how many cases does that tend to be?"
+
+```{r}
+library(dplyr)
+edges_with_fta_diff <- dominance_graph$edges %>%
+  # join "from" judge info (worse judge)
+  left_join(
+    top10_judges %>%
+      select(Judge_Name, pct_fta_from = pct_fta, n_cases_from = n_cases, pct_release_from = pct_release_v2),
+    by = c("from" = "Judge_Name")
+  ) %>%
+  # join "to" judge info (better judge)
+  left_join(
+    top10_judges %>%
+      select(Judge_Name, pct_fta_to = pct_fta),
+    by = c("to" = "Judge_Name")
+  ) %>%
+  mutate(
+    # difference in percentage points
+    fta_diff = pct_fta_from - pct_fta_to,
+    
+    # number of released cases for "from" judge
+    released_cases_from = n_cases_from * pct_release_from / 100,
+    
+    # scale by released cases
+    fta_diff_cases = (fta_diff / 100) * released_cases_from,
+    
+    # NEW: percent reduction relative to "from" judge's FTA rate
+    fta_diff_relative = fta_diff / pct_fta_from # pct_fta_to? 
+  )
+
+edges_with_fta_diff %>% head()
+
+# -----------------------------
+# Density plots
+# -----------------------------
+
+# 1. Percentage-point differences
+d1 <- density(edges_with_fta_diff$fta_diff, na.rm = TRUE)
+
+plot(
+  d1,
+  main = "Required Reduction in FTA Rate to Offset Rank Differences",
+  xlab = "FTA Reduction (percentage points)",
+  ylab = "Density"
+)
+
+abline(v = mean(edges_with_fta_diff$fta_diff, na.rm = TRUE), lty = 2)
+abline(v = median(edges_with_fta_diff$fta_diff, na.rm = TRUE), lty = 3)
+
+legend(
+  "topright",
+  legend = c("Mean", "Median"),
+  lty = c(2, 3),
+  bty = "n"
+)
+
+# 2. Case differences
+d2 <- density(edges_with_fta_diff$fta_diff_cases, na.rm = TRUE)
+
+plot(
+  d2,
+  main = "Equivalent Reduction in FTA Cases Among Released Defendants",
+  xlab = "Reduction in Number of FTA Cases",
+  ylab = "Density"
+)
+
+abline(v = mean(edges_with_fta_diff$fta_diff_cases, na.rm = TRUE), lty = 2)
+abline(v = median(edges_with_fta_diff$fta_diff_cases, na.rm = TRUE), lty = 3)
+
+legend(
+  "topright",
+  legend = c("Mean", "Median"),
+  lty = c(2, 3),
+  bty = "n"
+)
+
+# 3. Relative reduction (fraction of "from" judge FTA rate)
+d3 <- density(edges_with_fta_diff$fta_diff_relative, na.rm = TRUE)
+
+plot(
+  d3,
+  main = "Required Reduction as Fraction of Baseline FTA Rate",
+  xlab = "Fraction of From-Judge FTA Rate",
+  ylab = "Density"
+)
+
+abline(v = mean(edges_with_fta_diff$fta_diff_relative, na.rm = TRUE), lty = 2)
+abline(v = median(edges_with_fta_diff$fta_diff_relative, na.rm = TRUE), lty = 3)
+
+legend(
+  "topright",
+  legend = c("Mean", "Median"),
+  lty = c(2, 3),
+  bty = "n"
+)
+
+# -----------------------------
+# Summary statistics
+# -----------------------------
+
+summary_stats <- edges_with_fta_diff %>%
+  summarise(
+    # percentage-point differences
+    mean_fta_diff   = mean(fta_diff, na.rm = TRUE),
+    median_fta_diff = median(fta_diff, na.rm = TRUE),
+    iqr_fta_diff    = IQR(fta_diff, na.rm = TRUE),
+    
+    # case differences
+    mean_fta_cases   = mean(fta_diff_cases, na.rm = TRUE),
+    median_fta_cases = median(fta_diff_cases, na.rm = TRUE),
+    iqr_fta_cases    = IQR(fta_diff_cases, na.rm = TRUE),
+    
+    # relative reduction
+    mean_fta_relative   = mean(fta_diff_relative, na.rm = TRUE),
+    median_fta_relative = median(fta_diff_relative, na.rm = TRUE),
+    iqr_fta_relative    = IQR(fta_diff_relative, na.rm = TRUE)
+  )
+
+summary_stats
+```
+
+
+# Stability Analysis for Partial Ordering 
+
+```{r}
+set.seed(02138)
+
+check_edge_simulation <- function(edge_row, sim_list) {
+  
+  from_judge <- edge_row$from
+  to_judge   <- edge_row$to
+  
+  from_mat <- sim_list[[from_judge]]
+  to_mat   <- sim_list[[to_judge]]
+  
+  # ensure same number of simulations
+  B <- min(nrow(from_mat), nrow(to_mat))
+  
+  from_mat <- from_mat[1:B, ]
+  to_mat   <- to_mat[1:B, ]
+  
+  # relation:
+  # stricter = lower release rate
+  stricter_relation <- from_mat$release_rate_sim < to_mat$release_rate_sim
+  
+  # worse FTA = higher FTA
+  worse_fta_relation <- from_mat$fta_rate_sim > to_mat$fta_rate_sim
+  
+  relation_holds <- stricter_relation & worse_fta_relation
+  
+  tibble::tibble(
+    from = from_judge,
+    to = to_judge,
+    pct_relation_holds = mean(relation_holds, na.rm = TRUE) * 100,
+    n_holds = sum(relation_holds, na.rm = TRUE),
+    B = B
+  )
+}
+
+start_time <- Sys.time()
+# edge_support_sim %>% head()
+
+
+# Run the simulation
+edge_support_sim <- lapply(seq_len(nrow(edges)), function(i) {
+  check_edge_simulation(edges[i, ], sim_list)
+}) %>%
+  dplyr::bind_rows()
+
+# save(edge_support_sim, file = "[2026.03.24] edge_support_sim.RData")
+# load("[2026.03.24] edge_support_sim.RData.RData")
+
+end_time <- Sys.time()
+
+
+runtime <- end_time - start_time
+print(runtime)
+
+library(dplyr)
+
+edges <- edge_support_sim %>%
+  filter(pct_relation_holds > 60) %>%
+  select(from, to)
+
+```
+
+
+# Longest chains and anti chains
+
+```{r}
+library(igraph)
+
+# g <- graph_from_data_frame(
+#   dominance_graph$edges, # original setup
+#                            vertices = dominance_graph$vertices,
+#                            directed = TRUE)
+
+# --- get unique nodes from filtered edges ---
+vertex_names <- unique(c(edges$from, edges$to))
+
+# --- build graph ---
+g <- graph_from_data_frame(
+  edges,
+  vertices = vertex_names,   # works if vertices is just a character vector
+  directed = TRUE
+)
+
+
+# assumes DAG (dominance should be acyclic); if not, stop
+stopifnot(is_dag(g))
+
+topo <- topo_sort(g, mode = "out")
+dp   <- rep(1L, vcount(g))     # best path length starting at v
+nxt  <- rep(NA_integer_, vcount(g))  # next vertex on that best path
+
+# process in reverse topological order
+for (v in rev(topo)) {
+  outs <- neighbors(g, v, mode = "out")
+  if (length(outs) == 0) next
+  best <- outs[ which.max(dp[outs]) ]
+  dp[v]  <- 1L + dp[best]
+  nxt[v] <- best
+}
+
+start <- which.max(dp)
+
+# reconstruct chain
+chain_idx <- integer()
+cur <- start
+while (!is.na(cur)) {
+  chain_idx <- c(chain_idx, cur)
+  cur <- nxt[cur]
+}
+
+longest_chain <- V(g)$name[chain_idx]
+longest_chain
+length(longest_chain)          # number of vertices in chain
+length(longest_chain) - 1L     # number of edges in chain
+
+# Antichatin
+library(igraph)
+
+# Step 1: make an undirected comparability graph
+g_comp <- as.undirected(g, mode = "collapse")
+
+# Step 2: remove self-loops if any
+g_comp <- simplify(g_comp, remove.multiple = TRUE, remove.loops = TRUE)
+
+# Step 3: build the incomparability graph
+g_incomp <- complementer(g_comp, loops = FALSE)
+
+# Step 4: get all largest cliques = all maximum antichains
+largest_antichains_idx <- largest_cliques(g_incomp)
+
+# Convert first one to judge names
+longest_antichain <- V(g_incomp)$name[largest_antichains_idx[[1]]]
+
+# Output
+longest_antichain
+length(longest_antichain)
+```
+
+
+# graph with data - Figure 1
+
+
+```{r}
+# Filter to only those edges containing the top 5 most prolific judges 
+## Store existing object just in case
+edges.prime <- edges
+top5_judges <- judge.info.table.combined %>%
+  arrange(desc(n_cases)) %>%
+  slice(1:5) %>% # Adjust this for graph specs. A.9
+  pull(Judge_Name)
+
+edges <- edges %>%
+  filter(from %in% top5_judges & to %in% top5_judges)
+
+# partial.ordering
+library(igraph)
+
+# --- get unique nodes from filtered edges ---
+vertex_names <- unique(c(edges$from, edges$to))
+
+# --- build graph ---
+g <- graph_from_data_frame(
+  edges,
+  vertices = data.frame(name = top5_judges),  # <- key fix
+  directed = TRUE
+)
+
+short_labels <- sub(",.*$", "", V(g)$name)
+
+# Sugiyama layout
+lay <- layout_with_sugiyama(g)$layout
+
+# Rotate layout so ordering goes left → right
+lay <- cbind(lay[,2], lay[,1])
+
+# spacing
+horizontal_spacing <- 40
+vertical_spacing   <- 16
+
+lay[,1] <- lay[,1] * horizontal_spacing
+lay[,2] <- lay[,2] * vertical_spacing
+
+# label direction
+deg <- ifelse(lay[,1] < median(lay[,1]), pi, 0)
+
+png(
+  filename = "[2026.04.25] Partial Ordering top 10.png",
+  width = 60,
+  height = 30,
+  units = "in",
+  res = 300,
+  bg = "white"
+)
+
+plot(
+  g,
+  layout = lay,
+  vertex.size = 10,
+  vertex.color = "skyblue",
+  vertex.frame.color = "gray40",
+  vertex.label = short_labels,
+  vertex.label.cex = 2.5,
+  vertex.label.dist = 0,
+  vertex.label.degree = deg,
+  edge.arrow.size = 0.6,
+  edge.color = "gray40",
+  cex.main = 2.5,   # <-- THIS controls title size,
+  col.main = "white"
+
+)
+
+dev.off()
+```
+
+# Descriptive Statistics - Table 2
+
+## Decisions at arraignment (Make categories)
+
+```{r}
+# set to filtered data
+data <- data.prelim
+
+# If focusing on qualifying offenses: 
+data$release_v1 <- data$release_v2
+
+# -------------------------------
+# Define eligibility (i.e., valid arraignment decisions)
+# -------------------------------
+eligible_idx <- which(!is.na(data$release_v1))
+
+# -------------------------------
+# Define release vs detain based on v1
+# -------------------------------
+release_idx <- which(data$release_v1 == 1)
+detain_idx  <- which(data$release_v1 == 0)
+
+# (Optional sanity check: ensure both are subsets of eligible)
+release_idx <- intersect(release_idx, eligible_idx)
+detain_idx  <- intersect(detain_idx,  eligible_idx)
+
+# -------------------------------
+# Create datasets
+# -------------------------------
+data_release <- data[release_idx, ]
+data_detain  <- data[detain_idx,  ]
+
+# -------------------------------
+# (Optional) explicitly track excluded cases
+# -------------------------------
+exclude_idx <- which(is.na(data$release_v1))
+data_excluded <- data[exclude_idx, ]
+
+```
+
+
+## What percentage were released on recognizance? 
+
+```{r}
+# For the 'release' group
+pct_ror_release <- mean(data_release$ROR_at_Arraign == "Y", na.rm = TRUE) * 100
+
+# For the 'detain' group
+pct_ror_detain <- mean(data_detain$ROR_at_Arraign == "Y", na.rm = TRUE) * 100
+
+cat("Percentage ROR in release group:", round(pct_ror_release, 2), "%\n")
+cat("Percentage ROR in detain group:", round(pct_ror_detain, 2), "%\n")
+
+```
+
+## What percentage had monetary bail
+
+```{r}
+# For the 'release' group
+pct_bail_set_release <- mean(
+  data_release$Bail_Set_and_Posted_at_Arraign == "Y" |
+  data_release$Bail_Set_and_Not_Posted_at_Arraign == "Y",
+  na.rm = TRUE
+) * 100
+
+# For the 'detain' group
+pct_bail_set_detain <- mean(
+  data_detain$Bail_Set_and_Posted_at_Arraign == "Y" |
+  data_detain$Bail_Set_and_Not_Posted_at_Arraign == "Y",
+  na.rm = TRUE
+) * 100
+
+cat("Percentage with bail set (release group):", round(pct_bail_set_release, 2), "%\n")
+cat("Percentage with bail set (detain group):", round(pct_bail_set_detain, 2), "%\n")
+
+```
+
+## Monitoring conditions. 
+
+```{r}
+# Top 3 most common electronic monitoring conditions in the dataset
+# Select the relevant columns
+cols <- data[, 49:62]
+
+# Count number of "Y"s per column
+y_counts <- sapply(cols, function(col) sum(col == "Y", na.rm = TRUE))
+
+# Sort and get the top 3
+top3 <- sort(y_counts, decreasing = TRUE)[1:5]
+
+print(top3)
+
+```
+## Monitoring conditions breakdown. 
+
+```{r}
+# Define a helper function for the calculation
+get_pct_Y <- function(df) {
+  # New column: Y if either supervision or contact is Y
+  supervision_or_agency <- (df$Pretrial_Supervision_at_Arraign == "Y" | 
+                            df$Contact_Pretrial_Service_Agency == "Y")
+  pct_supervision_or_agency <- mean(supervision_or_agency, na.rm = TRUE) * 100
+  
+  pct_other_nmr <- mean(df$Other_NMR == "Y", na.rm = TRUE) * 100
+  pct_electronic_monitoring <- mean(df$Electronic_Monitoring == "Y", na.rm = TRUE) * 100
+  pct_no_firearms <- mean(df$No_Firearms_or_Weapons == "Y", na.rm = TRUE) * 100
+  
+  return(
+    c(
+      pct_supervision_or_agency = round(pct_supervision_or_agency, 2),
+      pct_other_nmr = round(pct_other_nmr, 2),
+      pct_electronic_monitoring = round(pct_electronic_monitoring, 2),
+      pct_no_firearms = round(pct_no_firearms, 2)
+    )
+  )
+}
+
+# Apply to each group
+release_supervision <- get_pct_Y(data_release)
+detain_supervision  <- get_pct_Y(data_detain)
+
+cat("Release group:\n")
+print(release_supervision)
+cat("\nDetain group:\n")
+print(detain_supervision)
+
+```
+## Nonmonetary bail
+
+```{r}
+# Helper function for percentage of NMR == "Y"
+get_pct_nmr <- function(df) {
+  mean(df$NMR_at_Arraign == "Y", na.rm = TRUE) * 100
+}
+
+# Apply to release and detain groups
+release_nmr <- get_pct_nmr(data_release)
+detain_nmr  <- get_pct_nmr(data_detain)
+
+cat("Release group:\n")
+print(round(release_nmr, 2))
+cat("\nDetain group:\n")
+print(round(detain_nmr, 2))
+
+```
+
+## demographic info:
+
+```{r}
+# race age
+data %>%
+  summarize(
+    pct_male = mean(Gender == "Male", na.rm = TRUE) * 100,
+    pct_nonwhite = mean(!(Race %in% c("White", "Unknown")) & !is.na(Race), na.rm = TRUE) * 100,
+    pct_hispanic = mean(Ethnicity == "Hispanic", na.rm = TRUE) * 100
+    # ,
+    # median_age = median(Age_at_Arrest, na.rm = TRUE),
+    # p25_age = quantile(Age_at_Arrest, 0.25, na.rm = TRUE),
+    # p75_age = quantile(Age_at_Arrest, 0.75, na.rm = TRUE)
+  )
+
+# Priors
+
+# Helper function to calculate the percentage where any of the variables > 0
+pct_any_prior_or_pending <- function(df) {
+  mean(
+    df$prior_vfo_cnt    > 0 |
+    df$prior_nonvfo_cnt > 0 |
+    df$prior_misd_cnt   > 0, # |
+    # df$pend_vfo         > 0 |
+    # df$pend_nonvfo      > 0 |
+    # df$pend_misd        > 0,
+    na.rm = TRUE
+  ) * 100
+}
+
+# Apply to both datasets
+pct_prior_pending_release <- pct_any_prior_or_pending(data_release)
+pct_prior_pending_detain  <- pct_any_prior_or_pending(data_detain)
+
+cat("Percentage with any prior/pending (release group):", round(pct_prior_pending_release, 2), "%\n")
+cat("Percentage with any prior/pending (detain group):", round(pct_prior_pending_detain, 2), "%\n")
+
+## Redone
+
+get_demographic_stats <- function(df) {
+  list(
+    pct_male     = mean(df$Gender == "Male", na.rm = TRUE) * 100,
+    pct_nonwhite = mean(!(df$Race %in% c("White", "Unknown")) & !is.na(df$Race), na.rm = TRUE) * 100,
+    pct_hispanic = mean(df$Ethnicity == "Hispanic", na.rm = TRUE) * 100,
+    # median_age   = median(df$Age_at_Arrest, na.rm = TRUE),
+    # p25_age      = quantile(df$Age_at_Arrest, 0.25, na.rm = TRUE),
+    # p75_age      = quantile(df$Age_at_Arrest, 0.75, na.rm = TRUE),
+    pct_any_prior = mean(
+      df$prior_vfo_cnt    > 0 |
+      df$prior_nonvfo_cnt > 0 |
+      df$prior_misd_cnt   > 0,
+      na.rm = TRUE
+    ) * 100
+  )
+}
+
+release_demo <- get_demographic_stats(data_release)
+detain_demo  <- get_demographic_stats(data_detain)
+
+cat("Release group:\n")
+print(release_demo)
+cat("\nDetain group:\n")
+print(detain_demo)
+
+
+```
+
+
+## representation
+
+```{r}
+# Helper function to get %Y and %N, excluding N/A
+get_pct_representation <- function(df) {
+  valid <- df %>%
+    filter(Representation_at_Securing_Order %in% c("Y", "N"))
+  
+  pct_yes <- mean(valid$Representation_at_Securing_Order == "Y", na.rm = TRUE) * 100
+  pct_no  <- mean(valid$Representation_at_Securing_Order == "N", na.rm = TRUE) * 100
+  
+  return(c(pct_yes = round(pct_yes, 2), pct_no = round(pct_no, 2)))
+}
+
+# Apply to release and detain groups
+release_representation <- get_pct_representation(data_release)
+detain_representation  <- get_pct_representation(data_detain)
+
+cat("Release group:\n")
+print(release_representation)
+
+cat("\nDetain group:\n")
+print(detain_representation)
+
+```
+
+
+## Outcomes
+
+```{r eval=FALSE, include=FALSE}
+# Define imprisonment-related values
+imprisonment_vals <- c("Imprisonment", "Imprisonment Time Served", "Imprisonment-Not Time Served")
+
+get_outcome_percentages_with_imprisonment <- function(df) {
+  pct_plea <- mean(df$Disposition_Type == "Plea", na.rm = TRUE) * 100
+  pct_rearrest <- mean(!(df$rearrest %in% c("NULL", "No Arrest")) & !is.na(df$rearrest), na.rm = TRUE) * 100
+  pct_verdict_tfg <- mean(df$Disposition_Type == "Verdict-TFG", na.rm = TRUE) * 100
+  pct_imprisonment <- mean(df$Most_Severe_Sentence %in% imprisonment_vals, na.rm = TRUE) * 100
+  
+  return(
+    c(
+      pct_plea = round(pct_plea, 2),
+      pct_rearrest = round(pct_rearrest, 2),
+      pct_verdict_tfg = round(pct_verdict_tfg, 2),
+      pct_imprisonment = round(pct_imprisonment, 2)
+    )
+  )
+}
+
+# Apply to both datasets
+release_outcomes <- get_outcome_percentages_with_imprisonment(data_release)
+detain_outcomes  <- get_outcome_percentages_with_imprisonment(data_detain)
+
+cat("Release group:\n")
+print(release_outcomes)
+cat("\nDetain group:\n")
+print(detain_outcomes)
+
+# For the release group
+subset_release <- data_release$Release.Decision.at.Arraign != "Disposed at arraign" &
+                  !is.na(data_release$Release.Decision.at.Arraign)
+
+fta_release <- mean(data_release$Warrant_Ordered_btw_Arraign_and_Dispo[subset_release] == "Y", na.rm = TRUE) * 100
+
+# For the detain group
+subset_detain <- data_detain$Release.Decision.at.Arraign != "Disposed at arraign" &
+                 !is.na(data_detain$Release.Decision.at.Arraign)
+
+fta_detain <- mean(data_detain$Warrant_Ordered_btw_Arraign_and_Dispo[subset_detain] == "Y", na.rm = TRUE) * 100
+
+cat("FTA percentage (release group):", round(fta_release, 2), "%\n")
+cat("FTA percentage (detain group):", round(fta_detain, 2), "%\n")
+
+```
+
+## How many judges in each group
+
+```{r}
+n_judges_release <- n_distinct(data_release$Judge_Name)
+n_judges_detain  <- n_distinct(data_detain$Judge_Name)
+
+cat("Number of distinct judges (release group):", n_judges_release, "\n")
+cat("Number of distinct judges (detain group):", n_judges_detain, "\n")
+```
+
+## Number of observations
+
+```{r}
+data_release %>% nrow()
+
+data_detain %>% nrow()
+```
+## Number of cases a judge hears in each group
+
+```{r}
+# For data_release
+data_release %>%
+  count(Judge_Name) %>%
+  summarize(
+    n_judges = n(),                    # number of unique judges
+    median_cases = median(n),          # median number of cases per judge
+    p25_cases = quantile(n, 0.25),     # 25th percentile
+    p75_cases = quantile(n, 0.75)      # 75th percentile
+  )
+
+# For data_detain
+data_detain %>%
+  count(Judge_Name) %>%
+  summarize(
+    n_judges = n(),                    # number of unique judges
+    median_cases = median(n),          # median number of cases per judge
+    p25_cases = quantile(n, 0.25),     # 25th percentile
+    p75_cases = quantile(n, 0.75)      # 75th percentile
+  )
+
+```
+
+# Get Qualifying Charges. 
+
+## June 2023
+
+```{r}
+# First clear environment and reload the preliminaries. 
+
+# Clear environment
+rm(list = ls())
+
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+library(sandwich)
+library(lmtest)
+library(dplyr)
+library(sandwich)
+library(readr)
+library(lmtest)
+
+# Create data.prelim object first.
+# Load the data 
+
+data.2020 <- read.csv("data.ny.2020.csv")
+data.2021    <- read.csv("data.ny.2021.csv")
+data.2022   <- read.csv("data.ny.2022.csv")
+data.2023       <- read.csv("data.ny.2023.csv")
+data.2024   <- read.csv("data.ny.2024.csv")
+# data.2020 <- read_csv(
+#   "data.ny.2020.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# data.2021 <- read_csv(
+#   "data.ny.2021.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# data.2022 <- read_csv(
+#   "data.ny.2022.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# data.2023 <- read_csv(
+#   "data.ny.2023.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# data.2024 <- read_csv(
+#   "data.ny.2024.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+
+# Combine the data 
+data <- rbind(data.2020, data.2021, data.2022, data.2023, data.2024)
+
+
+# # Debugging
+# library(readr)
+# data.2020 <- read_csv(
+#   "data.ny.2020.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# nrow(data.2020)
+# problems(data.2020)
+
+
+
+# Create the different varibles.
+
+# failure to appear
+w <- toupper(trimws(data$Warrant_Ordered_btw_Arraign_and_Dispo))
+d <- data$Release.Decision.at.Arraign == "Disposed at arraign"
+data$fta_flag <- ifelse(d, NA_real_, ifelse(w == "Y", 1, ifelse(w == "N", 0, NA_real_)))
+
+# release decisions
+data <- data %>%
+  mutate(release_v1 = ifelse(
+    Release.Decision.at.Arraign == "ROR" | Bail_Set_and_Posted_at_Arraign == "Y",
+    1, 0
+  )) # release_v1: defendant considered release iff they are released unconditionally.
+
+data <- data %>%
+  mutate(release_v2 = ifelse(
+    Release.Decision.at.Arraign %in% c("ROR", "Nonmonetary release") | # more lenient
+      Bail_Set_and_Posted_at_Arraign == "Y",
+    1, 0
+  )) # release_v2: defendant considered release iff they are released with or without conditions.
+
+# Force NA when disposed at arraignment or unknown
+data <- data %>%
+  mutate(
+    release_v1 = ifelse(Release.Decision.at.Arraign %in% c("Disposed at arraign", "Unknown"), NA_real_, release_v1),
+    release_v2 = ifelse(Release.Decision.at.Arraign %in% c("Disposed at arraign", "Unknown"), NA_real_, release_v2)
+  )
+
+# Force FTA to NA when defendant was not released under release_v2 - COMMENT OUT IF FOCUSING ON QUALIFYING CHARGES.
+data <- data %>%
+  mutate(
+    fta_flag = ifelse(release_v2 == 0, NA_real_, fta_flag)
+  )
+
+# Set new data object
+data.prelim <- data
+
+
+# Remove cases with nominal $1 bail (often used to credit time served on a different case)
+data.prelim <- data.prelim %>%
+  filter(Region == "NYC") %>%            # keep only NYC cases
+  filter(First_Bail_Set_Cash != 1 | is.na(First_Bail_Set_Cash))  # exclude $1 cash bail
+
+
+##### 
+
+# Function containing strings
+contains_any <- function(x, patterns) {
+  # x: single string (e.g., one charge)
+  # patterns: character vector of strings to search for
+  
+  pattern_regex <- paste(patterns, collapse = "|")
+  grepl(pattern_regex, x)
+}
+
+# example usage
+patterns <- c("215.50", "215.50")
+contains_any(
+  "PL 215.50 03 AM Crim Contempt-2nd:Disobey Crt",
+  patterns
+)
+
+# debugging to see if the strings are in there. 
+my_string <- "AF"
+any(grepl(my_string, data.prelim$Top_Charge_at_Arraign))
+mean(grepl(my_string, data.prelim$Top_Charge_at_Arraign))
+data.prelim$Top_Charge_at_Arraign[
+  grepl(my_string, data.prelim$Top_Charge_at_Arraign)
+] %>% unique
+
+# Generate string for qualifying offenses. 
+qualifying.offenses.charge.2023.06.09 <- c("70.02", # (a)
+                                           "215.15", # (b)
+                                           "215.11", "215.12", "215.13", # (c)
+                                           # mechanism for identifying (d) can be found below
+                                           "230.34", "70.80", "255.25", "255.26", "255.27", "130", # (e)
+                                           "105.15", # (f)
+                                           "470.24", "470.23", "470.22", "470.21", "490", # (g)
+                                           "PL 215.50 03 AM Crim Contempt-2nd:Disobey Crt", "PL 110-215.50 03 BM Crim Contempt-2nd:Disobey Crt", "PL 215.51 C EF Crim Cont-1: Pl215.50(3)-Prior", # (h)
+                                           "263.30", "263.05", "120.70", "263.10", "263.15", # (i)
+                                           "125", # (j)
+                                           "121.11", "121.12", "135.10", # (k)
+                                           "120.04", # (l)
+                                           # mechanism for identifying (m) can be found below
+                                           "120.12", "PL 265.01-A EF Crim Poss Weapon School Grds", # (n)
+                                           "155.42", "460.20", "470.20", # (o)
+                                           "168", "260.10", # (p)
+                                           "215.55", "215.56", "215.57", "205.05", "205.10", "205.15", # (q)
+                                           # mechanism for identifying (r) can be found below
+                                           "70.10", # (s)
+                                           # (t) is TBD
+                                           "265.02 03", "265.16" # (u)
+                                           )
+
+# For subsection d of 2023.06.09. 
+qualifying.offenses.charge.weight.2023.06.09 <- "AF"
+
+# For subsection m of 2023.06.09.
+hate_assault3.2023.06.09 <- function(x) {
+  if ((grepl("120\\.00", x) & grepl("Hate", x)) |
+      (grepl("150\\.10", x) & grepl("Hate", x))) {
+    return(1)
+  } else {
+    return(0)
+  }
+}
+
+# For subsection r of 2023.06.09.
+felony_supervision.2023.06.09 <- function(x) {
+  if (x[1] == "Felony" & x[2] == 1) {
+    return(1)
+  } else {
+    return(0)
+  }
+}
+
+# Create the function to determine if the offense qualifies under 2023.06.09 version. 
+qualifyng.charges.2023.06.09.function <- function(index = 1, data = data.prelim, date = "2023-06-01"){
+  # Check the arraignment date for this row
+  arraign_date <- as.Date(data$First_Arraign_Date[index], "%m/%d/%Y")
+
+  if (is.na(arraign_date) || arraign_date < as.Date(date)) {
+    return(0)
+  }
+  
+  # Sections (a) through (u) excluding (d), (m), and (r)
+  result1 <- contains_any(x = data$Top_Charge_at_Arraign[index], patterns = qualifying.offenses.charge.2023.06.09) %>% as.numeric()
+  
+  # (d)
+  result2 <- data$Top_Charge_Weight_at_Arraign[index] == qualifying.offenses.charge.weight.2023.06.09
+  result2 <- result2 %>% as.numeric()
+  
+  # (m)
+  result3 <- data$Top_Charge_at_Arraign[index] %>% hate_assault3.2023.06.09() %>% as.numeric()
+  
+  # (r)
+  result4 <- data[index, c("Top_Severity_at_Arraign", "supervision")] %>% felony_supervision.2023.06.09() %>% as.numeric()
+  
+  # Double checking section references
+  result5 <- contains_any(x = data$Top_Arraign_Article_Section[index], patterns = qualifying.offenses.charge.2023.06.09) %>% as.numeric()
+  
+  # Tally all conditions
+  result <- result1 + result2 + result3 + result4 + result5
+  
+  # Are any of the conditions satisfied? They are if the sum is greater than zero.
+  result <- result > 0
+  
+  # Conver result to number and return
+  result <- result %>% as.numeric()
+  result %>% return()
+}
+
+# Run the function and get vector indicating whether the charge qualifies under the 2023.06.09 changes post facto. 
+qualifyng.charges.2023.06.09.indicator <- sapply(X = 1:nrow(data.prelim), FUN = qualifyng.charges.2023.06.09.function)
+
+save(qualifyng.charges.2023.06.09.indicator,     file = "[2026.05.02] qualifyng.charges.2023.06.09.indicator.RData")
+```
+
+## May 2022
+
+```{r}
+# Clear environment
+rm(list = ls())
+
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+library(sandwich)
+library(lmtest)
+library(dplyr)
+library(sandwich)
+library(readr)
+library(lmtest)
+
+# Create data.prelim object first.
+# Load the data 
+
+data.2020 <- read.csv("data.ny.2020.csv")
+data.2021    <- read.csv("data.ny.2021.csv")
+data.2022   <- read.csv("data.ny.2022.csv")
+data.2023       <- read.csv("data.ny.2023.csv")
+data.2024   <- read.csv("data.ny.2024.csv")
+# data.2020 <- read_csv(
+#   "data.ny.2020.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# data.2021 <- read_csv(
+#   "data.ny.2021.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# data.2022 <- read_csv(
+#   "data.ny.2022.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# data.2023 <- read_csv(
+#   "data.ny.2023.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# data.2024 <- read_csv(
+#   "data.ny.2024.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+
+# Combine the data 
+data <- rbind(data.2020, data.2021, data.2022, data.2023, data.2024)
+
+
+# # Debugging
+# library(readr)
+# data.2020 <- read_csv(
+#   "data.ny.2020.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# nrow(data.2020)
+# problems(data.2020)
+
+
+
+# Create the different varibles.
+
+# failure to appear
+w <- toupper(trimws(data$Warrant_Ordered_btw_Arraign_and_Dispo))
+d <- data$Release.Decision.at.Arraign == "Disposed at arraign"
+data$fta_flag <- ifelse(d, NA_real_, ifelse(w == "Y", 1, ifelse(w == "N", 0, NA_real_)))
+
+# release decisions
+data <- data %>%
+  mutate(release_v1 = ifelse(
+    Release.Decision.at.Arraign == "ROR" | Bail_Set_and_Posted_at_Arraign == "Y",
+    1, 0
+  )) # release_v1: defendant considered release iff they are released unconditionally.
+
+data <- data %>%
+  mutate(release_v2 = ifelse(
+    Release.Decision.at.Arraign %in% c("ROR", "Nonmonetary release") | # more lenient
+      Bail_Set_and_Posted_at_Arraign == "Y",
+    1, 0
+  )) # release_v2: defendant considered release iff they are released with or without conditions.
+
+# Force NA when disposed at arraignment or unknown
+data <- data %>%
+  mutate(
+    release_v1 = ifelse(Release.Decision.at.Arraign %in% c("Disposed at arraign", "Unknown"), NA_real_, release_v1),
+    release_v2 = ifelse(Release.Decision.at.Arraign %in% c("Disposed at arraign", "Unknown"), NA_real_, release_v2)
+  )
+
+# Force FTA to NA when defendant was not released under release_v2 - COMMENT OUT IF FOCUSING ON QUALIFYING CHARGES.
+data <- data %>%
+  mutate(
+    fta_flag = ifelse(release_v2 == 0, NA_real_, fta_flag)
+  )
+
+# Set new data object
+data.prelim <- data
+
+
+# Remove cases with nominal $1 bail (often used to credit time served on a different case)
+data.prelim <- data.prelim %>%
+  filter(Region == "NYC") %>%            # keep only NYC cases
+  filter(First_Bail_Set_Cash != 1 | is.na(First_Bail_Set_Cash))  # exclude $1 cash bail
+
+
+##### 
+
+# Function containing strings
+contains_any <- function(x, patterns) {
+  # x: single string (e.g., one charge)
+  # patterns: character vector of strings to search for
+  
+  pattern_regex <- paste(patterns, collapse = "|")
+  grepl(pattern_regex, x)
+}
+
+# example usage
+patterns <- c("215.50", "215.50")
+contains_any(
+  "PL 215.50 03 AM Crim Contempt-2nd:Disobey Crt",
+  patterns
+)
+
+# debugging to see if the strings are in there. 
+my_string <- "AF"
+any(grepl(my_string, data.prelim$Top_Charge_at_Arraign))
+mean(grepl(my_string, data.prelim$Top_Charge_at_Arraign))
+data.prelim$Top_Charge_at_Arraign[
+  grepl(my_string, data.prelim$Top_Charge_at_Arraign)
+] %>% unique
+
+# Generate string for qualifying offenses. 
+qualifying.offenses.charge.2022.05.01 <- c("70.02", # (a)
+                                           "215.15", # (b)
+                                           "215.11", "215.12", "215.13", # (c)
+                                           # mechanism for identifying (d) can be found below
+                                           "230.34", "70.80", "255.25", "255.26", "255.27", "130", # (e)
+                                           "105.15", # (f)
+                                           "470.24", "470.23", "470.22", "470.21", "490", # (g)
+                                           "PL 215.50 03 AM Crim Contempt-2nd:Disobey Crt", "PL 110-215.50 03 BM Crim Contempt-2nd:Disobey Crt", "PL 215.51 C EF Crim Cont-1: Pl215.50(3)-Prior", # (h)
+                                           "263.30", "263.05", "120.70", "263.10", "263.15", # (i)
+                                           "125", # (j)
+                                           "121.11", "121.12", "135.10", # (k)
+                                           "120.04", # (l)
+                                           # mechanism for identifying (m) can be found below
+                                           "120.12", "PL 265.01-A EF Crim Poss Weapon School Grds", # (n)
+                                           "155.42", "460.20", "470.20", # (o)
+                                           "168", "260.10", # (p)
+                                           "215.55", "215.56", "215.57", "205.05", "205.10", "205.15", # (q)
+                                           # mechanism for identifying (r) can be found below
+                                           "70.10", # (s)
+                                           # (t) is TBD
+                                           "265.02 03", "265.16" # (u)
+                                           )
+
+# For subsection d of 2022.05.01. 
+qualifying.offenses.charge.weight.2022.05.01 <- "AF"
+
+# For subsection m of 2022.05.01.
+hate_assault3.2022.05.01 <- function(x) {
+  if ((grepl("120\\.00", x) & grepl("Hate", x)) |
+      (grepl("150\\.10", x) & grepl("Hate", x))) {
+    return(1)
+  } else {
+    return(0)
+  }
+}
+
+# For subsection r of 2022.05.01.
+felony_supervision.2022.05.01 <- function(x) {
+  if (x[1] == "Felony" & x[2] == 1) {
+    return(1)
+  } else {
+    return(0)
+  }
+}
+
+# Create the function to determine if the offense qualifies under 2022.05.01 version. 
+qualifyng.charges.2022.05.01.function <- function(index = 1, data = data.prelim, date = "2022-05-01"){
+  # Check the arraignment date for this row
+  arraign_date <- as.Date(data$First_Arraign_Date[index], "%m/%d/%Y")
+
+  if (is.na(arraign_date) || arraign_date < as.Date(date)) {
+    return(0)
+  }
+  
+  # Sections (a) through (u) excluding (d), (m), and (r)
+  result1 <- contains_any(x = data$Top_Charge_at_Arraign[index], patterns = qualifying.offenses.charge.2022.05.01) %>% as.numeric()
+  
+  # (d)
+  result2 <- data$Top_Charge_Weight_at_Arraign[index] == qualifying.offenses.charge.weight.2022.05.01
+  result2 <- result2 %>% as.numeric()
+  
+  # (m)
+  result3 <- data$Top_Charge_at_Arraign[index] %>% hate_assault3.2022.05.01() %>% as.numeric()
+  
+  # (r)
+  result4 <- data[index, c("Top_Severity_at_Arraign", "supervision")] %>% felony_supervision.2022.05.01() %>% as.numeric()
+  
+  # Double checking section references
+  result5 <- contains_any(x = data$Top_Arraign_Article_Section[index], patterns = qualifying.offenses.charge.2022.05.01) %>% as.numeric()
+  
+  # Tally all conditions
+  result <- result1 + result2 + result3 + result4 + result5
+  
+  # Are any of the conditions satisfied? They are if the sum is greater than zero.
+  result <- result > 0
+  
+  # Conver result to number and return
+  result <- result %>% as.numeric()
+  result %>% return()
+}
+
+# Run the function and get vector indicating whether the charge qualifies under the 2022.05.01 changes post facto. 
+qualifyng.charges.2022.05.01.indicator <- sapply(X = 1:nrow(data.prelim), FUN = qualifyng.charges.2022.05.01.function)
+
+save(qualifyng.charges.2022.05.01.indicator,     file = "[2026.05.02] qualifyng.charges.2022.05.01.indicator.RData")
+
+```
+
+
+## July 2020
+
+
+```{r}
+
+# Clear environment
+rm(list = ls())
+
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+library(sandwich)
+library(lmtest)
+library(dplyr)
+library(sandwich)
+library(readr)
+library(lmtest)
+
+# Create data.prelim object first.
+# Load the data 
+
+data.2020 <- read.csv("data.ny.2020.csv")
+data.2021    <- read.csv("data.ny.2021.csv")
+data.2022   <- read.csv("data.ny.2022.csv")
+data.2023       <- read.csv("data.ny.2023.csv")
+data.2024   <- read.csv("data.ny.2024.csv")
+# data.2020 <- read_csv(
+#   "data.ny.2020.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# data.2021 <- read_csv(
+#   "data.ny.2021.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# data.2022 <- read_csv(
+#   "data.ny.2022.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# data.2023 <- read_csv(
+#   "data.ny.2023.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# data.2024 <- read_csv(
+#   "data.ny.2024.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+
+# Combine the data 
+data <- rbind(data.2020, data.2021, data.2022, data.2023, data.2024)
+
+
+# # Debugging
+# library(readr)
+# data.2020 <- read_csv(
+#   "data.ny.2020.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# nrow(data.2020)
+# problems(data.2020)
+
+
+
+# Create the different varibles.
+
+# failure to appear
+w <- toupper(trimws(data$Warrant_Ordered_btw_Arraign_and_Dispo))
+d <- data$Release.Decision.at.Arraign == "Disposed at arraign"
+data$fta_flag <- ifelse(d, NA_real_, ifelse(w == "Y", 1, ifelse(w == "N", 0, NA_real_)))
+
+# release decisions
+data <- data %>%
+  mutate(release_v1 = ifelse(
+    Release.Decision.at.Arraign == "ROR" | Bail_Set_and_Posted_at_Arraign == "Y",
+    1, 0
+  )) # release_v1: defendant considered release iff they are released unconditionally.
+
+data <- data %>%
+  mutate(release_v2 = ifelse(
+    Release.Decision.at.Arraign %in% c("ROR", "Nonmonetary release") | # more lenient
+      Bail_Set_and_Posted_at_Arraign == "Y",
+    1, 0
+  )) # release_v2: defendant considered release iff they are released with or without conditions.
+
+# Force NA when disposed at arraignment or unknown
+data <- data %>%
+  mutate(
+    release_v1 = ifelse(Release.Decision.at.Arraign %in% c("Disposed at arraign", "Unknown"), NA_real_, release_v1),
+    release_v2 = ifelse(Release.Decision.at.Arraign %in% c("Disposed at arraign", "Unknown"), NA_real_, release_v2)
+  )
+
+# Force FTA to NA when defendant was not released under release_v2 - COMMENT OUT IF FOCUSING ON QUALIFYING CHARGES.
+data <- data %>%
+  mutate(
+    fta_flag = ifelse(release_v2 == 0, NA_real_, fta_flag)
+  )
+
+# Set new data object
+data.prelim <- data
+
+
+# Remove cases with nominal $1 bail (often used to credit time served on a different case)
+data.prelim <- data.prelim %>%
+  filter(Region == "NYC") %>%            # keep only NYC cases
+  filter(First_Bail_Set_Cash != 1 | is.na(First_Bail_Set_Cash))  # exclude $1 cash bail
+
+
+#####
+
+# Function containing strings
+contains_any <- function(x, patterns) {
+  # x: single string (e.g., one charge)
+  # patterns: character vector of strings to search for
+  
+  pattern_regex <- paste(patterns, collapse = "|")
+  grepl(pattern_regex, x)
+}
+
+# example usage
+patterns <- c("215.50", "215.50")
+contains_any(
+  "PL 215.50 03 AM Crim Contempt-2nd:Disobey Crt",
+  patterns
+)
+
+# # debugging to see if the strings are in there. 
+# my_string <- "AF"
+# any(grepl(my_string, data.prelim$Top_Charge_at_Arraign))
+# mean(grepl(my_string, data.prelim$Top_Charge_at_Arraign))
+# data.prelim$Top_Charge_at_Arraign[
+#   grepl(my_string, data.prelim$Top_Charge_at_Arraign)
+# ] %>% unique
+
+# Generate string for qualifying offenses. 
+qualifying.offenses.charge.2020.07.01 <- c("70.02", # (a)
+                                           "215.15", # (b)
+                                           "215.11", "215.12", "215.13", # (c)
+                                           # mechanism for identifying (d) can be found below
+                                           "230.34", "70.80", "255.25", "255.26", "255.27", "130", # (e)
+                                           "105.15", # (f)
+                                           "470.24", "470.23", "470.22", "470.21", "490", # (g)
+                                           "PL 215.50 03 AM Crim Contempt-2nd:Disobey Crt", "PL 110-215.50 03 BM Crim Contempt-2nd:Disobey Crt", "PL 215.51 C EF Crim Cont-1: Pl215.50(3)-Prior", # (h)
+                                           "263.30", "263.05", "120.70", "263.10", "263.15", # (i)
+                                           "125", # (j)
+                                           "121.11", "121.12", "135.10", # (k)
+                                           "120.04", # (l)
+                                           # mechanism for identifying (m) can be found below
+                                           "120.12", "PL 265.01-A EF Crim Poss Weapon School Grds", # (n)
+                                           "155.42", "460.20", "470.20", # (o)
+                                           "168", "260.10", # (p)
+                                           "215.55", "215.56", "215.57", "205.05", "205.10", "205.15", # (q)
+                                           # mechanism for identifying (r) can be found below
+                                           "70.10"
+                                           # , # (s)
+                                           # (t) is TBD
+                                           )
+
+# For subsection d of 2020.07.01. 
+qualifying.offenses.charge.weight.2020.07.01 <- "AF"
+
+# For subsection m of 2020.07.01.
+hate_assault3.2020.07.01 <- function(x) {
+  if ((grepl("120\\.00", x) & grepl("Hate", x)) |
+      (grepl("150\\.10", x) & grepl("Hate", x))) {
+    return(1)
+  } else {
+    return(0)
+  }
+}
+
+# For subsection r of 2020.07.01.
+felony_supervision.2020.07.01 <- function(x) {
+  if (x[1] == "Felony" & x[2] == 1) {
+    return(1)
+  } else {
+    return(0)
+  }
+}
+
+# Create the function to determine if the offense qualifies under 2020.07.01 version. 
+qualifyng.charges.2020.07.01.function <- function(index = 1, data = data.prelim, date = "2020-07-01"){
+  # Check the arraignment date for this row
+  arraign_date <- as.Date(data$First_Arraign_Date[index], "%m/%d/%Y")
+
+  if (is.na(arraign_date) || arraign_date < as.Date(date)) {
+    return(0)
+  }
+  
+  # Sections (a) through (u) excluding (d), (m), and (r)
+  result1 <- contains_any(x = data$Top_Charge_at_Arraign[index], patterns = qualifying.offenses.charge.2020.07.01) %>% as.numeric()
+  
+  # (d)
+  result2 <- data$Top_Charge_Weight_at_Arraign[index] == qualifying.offenses.charge.weight.2020.07.01
+  result2 <- result2 %>% as.numeric()
+  
+  # (m)
+  result3 <- data$Top_Charge_at_Arraign[index] %>% hate_assault3.2020.07.01() %>% as.numeric()
+  
+  # (r)
+  result4 <- data[index, c("Top_Severity_at_Arraign", "supervision")] %>% felony_supervision.2020.07.01() %>% as.numeric()
+  
+  # Double checking section references
+  result5 <- contains_any(x = data$Top_Arraign_Article_Section[index], patterns = qualifying.offenses.charge.2020.07.01) %>% as.numeric()
+  
+  # Tally all conditions
+  result <- result1 + result2 + result3 + result4 + result5
+  
+  # Are any of the conditions satisfied? They are if the sum is greater than zero.
+  result <- result > 0
+  
+  # Conver result to number and return
+  result <- result %>% as.numeric()
+  result %>% return()
+}
+
+# Run the function and get vector indicating whether the charge qualifies under the 2020.07.01 changes post facto. 
+qualifyng.charges.2020.07.01.indicator <- sapply(X = 1:nrow(data.prelim), FUN = qualifyng.charges.2020.07.01.function)
+
+save(qualifyng.charges.2020.07.01.indicator,     file = "[2026.05.02] qualifyng.charges.2020.07.01.indicator.RData")
+
+# load("[2026.03.10.1] qualifyng.charges.2020.07.01.indicator.RData")
+
+```
+
+
+## January 2020
+
+```{r}
+
+# Clear environment
+rm(list = ls())
+
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+library(sandwich)
+library(lmtest)
+library(dplyr)
+library(sandwich)
+library(readr)
+library(lmtest)
+
+# Create data.prelim object first.
+# Load the data 
+
+data.2020 <- read.csv("data.ny.2020.csv")
+data.2021    <- read.csv("data.ny.2021.csv")
+data.2022   <- read.csv("data.ny.2022.csv")
+data.2023       <- read.csv("data.ny.2023.csv")
+data.2024   <- read.csv("data.ny.2024.csv")
+# data.2020 <- read_csv(
+#   "data.ny.2020.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# data.2021 <- read_csv(
+#   "data.ny.2021.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# data.2022 <- read_csv(
+#   "data.ny.2022.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# data.2023 <- read_csv(
+#   "data.ny.2023.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# data.2024 <- read_csv(
+#   "data.ny.2024.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+
+# Combine the data 
+data <- rbind(data.2020, data.2021, data.2022, data.2023, data.2024)
+
+
+# # Debugging
+# library(readr)
+# data.2020 <- read_csv(
+#   "data.ny.2020.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# nrow(data.2020)
+# problems(data.2020)
+
+
+
+# Create the different varibles.
+
+# failure to appear
+w <- toupper(trimws(data$Warrant_Ordered_btw_Arraign_and_Dispo))
+d <- data$Release.Decision.at.Arraign == "Disposed at arraign"
+data$fta_flag <- ifelse(d, NA_real_, ifelse(w == "Y", 1, ifelse(w == "N", 0, NA_real_)))
+
+# release decisions
+data <- data %>%
+  mutate(release_v1 = ifelse(
+    Release.Decision.at.Arraign == "ROR" | Bail_Set_and_Posted_at_Arraign == "Y",
+    1, 0
+  )) # release_v1: defendant considered release iff they are released unconditionally.
+
+data <- data %>%
+  mutate(release_v2 = ifelse(
+    Release.Decision.at.Arraign %in% c("ROR", "Nonmonetary release") | # more lenient
+      Bail_Set_and_Posted_at_Arraign == "Y",
+    1, 0
+  )) # release_v2: defendant considered release iff they are released with or without conditions.
+
+# Force NA when disposed at arraignment or unknown
+data <- data %>%
+  mutate(
+    release_v1 = ifelse(Release.Decision.at.Arraign %in% c("Disposed at arraign", "Unknown"), NA_real_, release_v1),
+    release_v2 = ifelse(Release.Decision.at.Arraign %in% c("Disposed at arraign", "Unknown"), NA_real_, release_v2)
+  )
+
+# Force FTA to NA when defendant was not released under release_v2 - COMMENT OUT IF FOCUSING ON QUALIFYING CHARGES.
+data <- data %>%
+  mutate(
+    fta_flag = ifelse(release_v2 == 0, NA_real_, fta_flag)
+  )
+
+# Set new data object
+data.prelim <- data
+
+
+# Remove cases with nominal $1 bail (often used to credit time served on a different case)
+data.prelim <- data.prelim %>%
+  filter(Region == "NYC") %>%            # keep only NYC cases
+  filter(First_Bail_Set_Cash != 1 | is.na(First_Bail_Set_Cash))  # exclude $1 cash bail
+
+
+#####
+
+# Function containing strings
+contains_any <- function(x, patterns) {
+  # x: single string (e.g., one charge)
+  # patterns: character vector of strings to search for
+  
+  pattern_regex <- paste(patterns, collapse = "|")
+  grepl(pattern_regex, x)
+}
+
+# example usage
+patterns <- c("215.50", "215.50")
+contains_any(
+  "PL 215.50 03 AM Crim Contempt-2nd:Disobey Crt",
+  patterns
+)
+
+# # debugging to see if the strings are in there. 
+# my_string <- "AF"
+# any(grepl(my_string, data.prelim$Top_Charge_at_Arraign))
+# mean(grepl(my_string, data.prelim$Top_Charge_at_Arraign))
+# data.prelim$Top_Charge_at_Arraign[
+#   grepl(my_string, data.prelim$Top_Charge_at_Arraign)
+# ] %>% unique
+
+# Generate string for qualifying offenses. 
+qualifying.offenses.charge.2020.01.01 <- c("70.02", # (a)
+                                           "215.15", # (b)
+                                           "215.11", "215.12", "215.13", # (c)
+                                           # mechanism for identifying (d) can be found below
+                                           "230.34", "70.80", "255.25", "255.26", "255.27", "130", # (e)
+                                           "105.15", # (f)
+                                           "470.24", "470.23", "470.22", "470.21", "490", # (g)
+                                           "PL 215.50 03 AM Crim Contempt-2nd:Disobey Crt", "PL 110-215.50 03 BM Crim Contempt-2nd:Disobey Crt", "PL 215.51 C EF Crim Cont-1: Pl215.50(3)-Prior", # (h)
+                                           "263.30", "263.05", "120.70" # (i) 
+                                           # "263.10", "263.15", # (i)
+                                           # "125", # (j)
+                                           # "121.11", "121.12", "135.10", # (k)
+                                           # "120.04", # (l)
+                                           # # mechanism for identifying (m) can be found below
+                                           # "120.12", "PL 265.01-A EF Crim Poss Weapon School Grds", # (n)
+                                           # "155.42", "460.20", "470.20", # (o)
+                                           # "168", "260.10", # (p)
+                                           # "215.55", "215.56", "215.57", "205.05", "205.10", "205.15", # (q)
+                                           # # mechanism for identifying (r) can be found below
+                                           # "70.10"
+                                           # # , # (s)
+                                           # # (t) is TBD
+                                           )
+
+# For subsection d of 2020.01.01. 
+qualifying.offenses.charge.weight.2020.01.01 <- "AF"
+
+# # For subsection m of 2020.01.01.
+# hate_assault3.2020.01.01 <- function(x) {
+#   if ((grepl("120\\.00", x) & grepl("Hate", x)) |
+#       (grepl("150\\.10", x) & grepl("Hate", x))) {
+#     return(1)
+#   } else {
+#     return(0)
+#   }
+# }
+
+# # For subsection r of 2020.01.01.
+# felony_supervision.2020.01.01 <- function(x) {
+#   if (x[1] == "Felony" & x[2] == 1) {
+#     return(1)
+#   } else {
+#     return(0)
+#   }
+# }
+
+# Create the function to determine if the offense qualifies under 2020.01.01 version. 
+qualifyng.charges.2020.01.01.function <- function(index = 1, data = data.prelim, date = "2020-01-01"){
+  # Check the arraignment date for this row
+  arraign_date <- as.Date(data$First_Arraign_Date[index], "%m/%d/%Y")
+
+  if (is.na(arraign_date) || arraign_date < as.Date(date)) {
+    return(0)
+  }
+  
+  # Sections (a) through (u) excluding (d), (m), and (r)
+  result1 <- contains_any(x = data$Top_Charge_at_Arraign[index], patterns = qualifying.offenses.charge.2020.01.01) %>% as.numeric()
+  
+  # (d)
+  result2 <- data$Top_Charge_Weight_at_Arraign[index] == qualifying.offenses.charge.weight.2020.01.01
+  result2 <- result2 %>% as.numeric()
+  
+  # (m)
+  result3 <- 0
+    # data$Top_Charge_at_Arraign[index] %>% hate_assault3.2020.01.01() %>% as.numeric()
+  
+  # (r)
+  result4 <- 0
+    # data[index, c("Top_Severity_at_Arraign", "supervision")] %>% felony_supervision.2020.01.01() %>% as.numeric()
+  
+  # Double checking section references
+  result5 <- contains_any(x = data$Top_Arraign_Article_Section[index], patterns = qualifying.offenses.charge.2020.01.01) %>% as.numeric()
+  
+  # Tally all conditions
+  result <- result1 + result2 + result3 + result4 + result5
+  
+  # Are any of the conditions satisfied? They are if the sum is greater than zero.
+  result <- result > 0
+  
+  # Conver result to number and return
+  result <- result %>% as.numeric()
+  result %>% return()
+}
+
+# Run the function and get vector indicating whether the charge qualifies under the 2020.01.01 changes post facto. 
+qualifyng.charges.2020.01.01.indicator <- sapply(X = 1:nrow(data.prelim), FUN = qualifyng.charges.2020.01.01.function)
+
+# save(qualifyng.charges.2020.01.01.indicator,     file = "[2026.05.02] qualifyng.charges.2020.01.01.indicator.RData")
+
+# load("[2026.03.10.1] qualifyng.charges.2020.01.01.indicator.RData")
+
+```
+
+## Append everything to make the qualifying charges vector. 
+
+```{r}
+
+# Clear environment
+rm(list = ls())
+
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+library(sandwich)
+library(lmtest)
+library(dplyr)
+library(sandwich)
+library(readr)
+library(lmtest)
+
+# Create data.prelim object first.
+# Load the data 
+
+data.2020 <- read.csv("data.ny.2020.csv")
+data.2021    <- read.csv("data.ny.2021.csv")
+data.2022   <- read.csv("data.ny.2022.csv")
+data.2023       <- read.csv("data.ny.2023.csv")
+data.2024   <- read.csv("data.ny.2024.csv")
+# data.2020 <- read_csv(
+#   "data.ny.2020.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# data.2021 <- read_csv(
+#   "data.ny.2021.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# data.2022 <- read_csv(
+#   "data.ny.2022.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# data.2023 <- read_csv(
+#   "data.ny.2023.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# data.2024 <- read_csv(
+#   "data.ny.2024.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+
+# Combine the data 
+data <- rbind(data.2020, data.2021, data.2022, data.2023, data.2024)
+
+
+# # Debugging
+# library(readr)
+# data.2020 <- read_csv(
+#   "data.ny.2020.csv",
+#   show_col_types = FALSE,
+#   progress = TRUE
+# )
+# 
+# nrow(data.2020)
+# problems(data.2020)
+
+
+
+# Create the different varibles.
+
+# failure to appear
+w <- toupper(trimws(data$Warrant_Ordered_btw_Arraign_and_Dispo))
+d <- data$Release.Decision.at.Arraign == "Disposed at arraign"
+data$fta_flag <- ifelse(d, NA_real_, ifelse(w == "Y", 1, ifelse(w == "N", 0, NA_real_)))
+
+# release decisions
+data <- data %>%
+  mutate(release_v1 = ifelse(
+    Release.Decision.at.Arraign == "ROR" | Bail_Set_and_Posted_at_Arraign == "Y",
+    1, 0
+  )) # release_v1: defendant considered release iff they are released unconditionally.
+
+data <- data %>%
+  mutate(release_v2 = ifelse(
+    Release.Decision.at.Arraign %in% c("ROR", "Nonmonetary release") | # more lenient
+      Bail_Set_and_Posted_at_Arraign == "Y",
+    1, 0
+  )) # release_v2: defendant considered release iff they are released with or without conditions.
+
+# Force NA when disposed at arraignment or unknown
+data <- data %>%
+  mutate(
+    release_v1 = ifelse(Release.Decision.at.Arraign %in% c("Disposed at arraign", "Unknown"), NA_real_, release_v1),
+    release_v2 = ifelse(Release.Decision.at.Arraign %in% c("Disposed at arraign", "Unknown"), NA_real_, release_v2)
+  )
+
+# Force FTA to NA when defendant was not released under release_v2 - COMMENT OUT IF FOCUSING ON QUALIFYING CHARGES.
+data <- data %>%
+  mutate(
+    fta_flag = ifelse(release_v2 == 0, NA_real_, fta_flag)
+  )
+
+# Set new data object
+data.prelim <- data
+
+
+# Remove cases with nominal $1 bail (often used to credit time served on a different case)
+data.prelim <- data.prelim %>%
+  filter(Region == "NYC") %>%            # keep only NYC cases
+  filter(First_Bail_Set_Cash != 1 | is.na(First_Bail_Set_Cash))  # exclude $1 cash bail
+
+#####
+
+load("[2026.05.02] qualifyng.charges.2023.06.09.indicator.RData")
+load("[2026.05.02] qualifyng.charges.2022.05.01.indicator.RData")
+load("[2026.05.02] qualifyng.charges.2020.07.01.indicator.RData")
+load("[2026.05.02] qualifyng.charges.2020.01.01.indicator.RData")
+
+# Get violent felonies per section a.
+qualifyng.charges.VFO <- data.prelim$Top_Charge_at_Arraign_Violent_Felony_Ind == "Y"
+qualifyng.charges.VFO <- qualifyng.charges.VFO %>% as.numeric()
+
+qualifying.charges.matrix <- cbind(
+                                   qualifyng.charges.2023.06.09.indicator,
+                                   qualifyng.charges.2022.05.01.indicator,
+                                   qualifyng.charges.2020.07.01.indicator,
+                                   qualifyng.charges.2020.01.01.indicator,
+                                   qualifyng.charges.VFO)
+
+# save(qualifying.charges.matrix, file = "[2026.05.02] qualifying.charges.matrix.RData")
+
+qualifying.charges.any <- as.numeric(rowSums(qualifying.charges.matrix) > 0)
+
+# save(qualifying.charges.any, file = "[2026.05.02] qualifying.charges.any.RData")
+# load("[2026.05.02] qualifying.charges.any.RData")
+
+data.prelim <- cbind(data.prelim, qualifying.charges.any)
+```
+
+# Calculating Aggregate FTA rates. 
+
+## Non-Qualifying charges, FTA among those ROR. 
+```{r}
+data.prelim <- data
+
+# Remove cases with nominal $1 bail (often used to credit time served on a different case)
+data.prelim <- data.prelim %>%
+  filter(Region == "NYC") %>%            # keep only NYC cases
+  filter(First_Bail_Set_Cash != 1 | is.na(First_Bail_Set_Cash))  # exclude $1 cash bail
+
+# load("[2026.03.10.1] qualifying.charges.any.RData") # old
+load("[2026.05.02] qualifying.charges.any.RData")
+data.prelim <- cbind(data.prelim, qualifying.charges.any)
+
+process_release <- function(filter_qualifying = FALSE) {
+  
+  if (filter_qualifying) {
+    
+    # Keep only qualifying charges
+    data.prelim <<- data.prelim[data.prelim$qualifying.charges.any == 1, ]
+    
+  } else {
+    # Force FTA to NA when defendant was not released under release_v1 - you *MAY* WANT TO COMMENT OUT IF FOCUSING ON QUALIFYING CHARGES.
+  data.prelim <- data.prelim %>%
+    mutate(
+      fta_flag = ifelse(release_v1 == 0, NA_real_, fta_flag)
+    )
+    
+    # Set release_v2 = release_v1 for non-qualifying
+    idx <- data.prelim$qualifying.charges.any == 0
+    data.prelim$release_v2[idx] <<- data.prelim$release_v1[idx]
+    
+    # Keep only non-qualifying
+    data.prelim <<- data.prelim[idx, ]
+  }
+}
+
+# Non-Qualifying offenses
+process_release()
+
+# Qualifying offenses
+# process_release(TRUE)
+
+
+# Filter out fewer than 100 cases. 
+  ## get numbers
+  judge_release_table.prelim <- data.prelim %>%
+  group_by(Judge_Name) %>%
+  summarise(
+    n_cases = n(), # [2025.12.18] number of cases
+    pct_release_v1 = mean(release_v1, na.rm = TRUE) * 100,
+    pct_release_v2 = mean(release_v2, na.rm = TRUE) * 100
+  )
+  
+  ## judges with at least 100 cases (in the prelim table)
+keep_judges <- judge_release_table.prelim %>%
+  filter(n_cases >= 100) %>% # Standard
+  # filter(n_cases >= 150) %>% # Robustness check - A.7
+  # filter(n_cases >= 50) %>% # Robustness check - A.7
+    pull(Judge_Name)
+
+  ## filter data.prelim to only those judges
+  data.prelim.100 <- data.prelim %>%
+  filter(Judge_Name %in% keep_judges)
+  
+  ## complete the filtering
+  data.prelim <- data.prelim.100
+  
+# Overall FTA rate among defendants released under release_v1
+fta_rate_release_v1 <- data.prelim %>%
+  filter(release_v1 == 1) %>%
+  summarise(
+    n_released = n(),
+    n_nonmissing_fta = sum(!is.na(fta_flag)),
+    n_fta = sum(fta_flag == 1, na.rm = TRUE),
+    fta_rate = mean(fta_flag, na.rm = TRUE) * 100
+  )
+
+fta_rate_release_v1
+```
+
+## Non-Qualifying charges, FTA among those Released with conditions. 
+```{r}
+data.prelim <- data
+
+# Remove cases with nominal $1 bail (often used to credit time served on a different case)
+data.prelim <- data.prelim %>%
+  filter(Region == "NYC") %>%            # keep only NYC cases
+  filter(First_Bail_Set_Cash != 1 | is.na(First_Bail_Set_Cash))  # exclude $1 cash bail
+
+# load("[2026.03.10.1] qualifying.charges.any.RData") # old
+load("[2026.05.02] qualifying.charges.any.RData")
+data.prelim <- cbind(data.prelim, qualifying.charges.any)
+
+process_release <- function(filter_qualifying = FALSE) {
+  
+  if (filter_qualifying) {
+    
+    # Keep only qualifying charges
+    data.prelim <<- data.prelim[data.prelim$qualifying.charges.any == 1, ]
+    
+  } else {
+  #   # Force FTA to NA when defendant was not released under release_v1 - you *MAY* WANT TO COMMENT OUT IF FOCUSING ON QUALIFYING CHARGES.
+  # data.prelim <- data.prelim %>%
+  #   mutate(
+  #     fta_flag = ifelse(release_v1 == 0, NA_real_, fta_flag)
+  #   )
+    
+    # Set release_v2 = release_v1 for non-qualifying
+    idx <- data.prelim$qualifying.charges.any == 0
+    # data.prelim$release_v2[idx] <<- data.prelim$release_v1[idx]
+    
+    # Keep only non-qualifying
+    data.prelim <<- data.prelim[idx, ]
+  }
+}
+
+# Non-Qualifying offenses
+process_release()
+
+# Qualifying offenses
+# process_release(TRUE)
+
+
+# Filter out fewer than 100 cases. 
+  ## get numbers
+  judge_release_table.prelim <- data.prelim %>%
+  group_by(Judge_Name) %>%
+  summarise(
+    n_cases = n(), # [2025.12.18] number of cases
+    pct_release_v1 = mean(release_v1, na.rm = TRUE) * 100,
+    pct_release_v2 = mean(release_v2, na.rm = TRUE) * 100
+  )
+  
+  ## judges with at least 100 cases (in the prelim table)
+keep_judges <- judge_release_table.prelim %>%
+  filter(n_cases >= 100) %>% # Standard
+  # filter(n_cases >= 150) %>% # Robustness check - A.7
+  # filter(n_cases >= 50) %>% # Robustness check - A.7
+    pull(Judge_Name)
+
+  ## filter data.prelim to only those judges
+  data.prelim.100 <- data.prelim %>%
+  filter(Judge_Name %in% keep_judges)
+  
+  ## complete the filtering
+  data.prelim <- data.prelim.100
+  
+# Overall FTA rate among defendants released under release_v2 but not release_v1
+# i.e., released with conditions / nonmonetary release
+fta_rate_release_v2_not_v1 <- data.prelim %>%
+  filter(release_v2 == 1, release_v1 == 0) %>%
+  summarise(
+    n_released_v2_not_v1 = n(),
+    n_nonmissing_fta = sum(!is.na(fta_flag)),
+    n_fta = sum(fta_flag == 1, na.rm = TRUE),
+    fta_rate = mean(fta_flag, na.rm = TRUE) * 100
+  )
+
+fta_rate_release_v2_not_v1
+```
+
+## Qualifying charges, FTA among those ROR. 
+```{r}
+data.prelim <- data
+
+# Remove cases with nominal $1 bail (often used to credit time served on a different case)
+data.prelim <- data.prelim %>%
+  filter(Region == "NYC") %>%            # keep only NYC cases
+  filter(First_Bail_Set_Cash != 1 | is.na(First_Bail_Set_Cash))  # exclude $1 cash bail
+
+# load("[2026.03.10.1] qualifying.charges.any.RData") # old
+load("[2026.05.02] qualifying.charges.any.RData")
+data.prelim <- cbind(data.prelim, qualifying.charges.any)
+
+process_release <- function(filter_qualifying = FALSE) {
+  
+  if (filter_qualifying) {
+    
+    # Keep only qualifying charges
+    data.prelim <<- data.prelim[data.prelim$qualifying.charges.any == 1, ]
+    
+  } else {
+    # Force FTA to NA when defendant was not released under release_v1 - you *MAY* WANT TO COMMENT OUT IF FOCUSING ON QUALIFYING CHARGES.
+  data.prelim <- data.prelim %>%
+    mutate(
+      fta_flag = ifelse(release_v1 == 0, NA_real_, fta_flag)
+    )
+    
+    # Set release_v2 = release_v1 for non-qualifying
+    idx <- data.prelim$qualifying.charges.any == 0
+    data.prelim$release_v2[idx] <<- data.prelim$release_v1[idx]
+    
+    # Keep only non-qualifying
+    data.prelim <<- data.prelim[idx, ]
+  }
+}
+
+# # Non-Qualifying offenses
+# process_release()
+
+# Qualifying offenses
+process_release(TRUE)
+
+
+# Filter out fewer than 100 cases. 
+  ## get numbers
+  judge_release_table.prelim <- data.prelim %>%
+  group_by(Judge_Name) %>%
+  summarise(
+    n_cases = n(), # [2025.12.18] number of cases
+    pct_release_v1 = mean(release_v1, na.rm = TRUE) * 100,
+    pct_release_v2 = mean(release_v2, na.rm = TRUE) * 100
+  )
+  
+  ## judges with at least 100 cases (in the prelim table)
+keep_judges <- judge_release_table.prelim %>%
+  filter(n_cases >= 100) %>% # Standard
+  # filter(n_cases >= 150) %>% # Robustness check - A.7
+  # filter(n_cases >= 50) %>% # Robustness check - A.7
+    pull(Judge_Name)
+
+  ## filter data.prelim to only those judges
+  data.prelim.100 <- data.prelim %>%
+  filter(Judge_Name %in% keep_judges)
+  
+  ## complete the filtering
+  data.prelim <- data.prelim.100
+  
+# Overall FTA rate among defendants released under release_v1
+fta_rate_release_v1 <- data.prelim %>%
+  filter(release_v1 == 1) %>%
+  summarise(
+    n_released = n(),
+    n_nonmissing_fta = sum(!is.na(fta_flag)),
+    n_fta = sum(fta_flag == 1, na.rm = TRUE),
+    fta_rate = mean(fta_flag, na.rm = TRUE) * 100
+  )
+
+fta_rate_release_v1
+```
+
+
+## Qualifying charges, FTA among those Released with conditions. 
+```{r}
+data.prelim <- data
+
+# Remove cases with nominal $1 bail (often used to credit time served on a different case)
+data.prelim <- data.prelim %>%
+  filter(Region == "NYC") %>%            # keep only NYC cases
+  filter(First_Bail_Set_Cash != 1 | is.na(First_Bail_Set_Cash))  # exclude $1 cash bail
+
+# load("[2026.03.10.1] qualifying.charges.any.RData") # old
+load("[2026.05.02] qualifying.charges.any.RData")
+data.prelim <- cbind(data.prelim, qualifying.charges.any)
+
+process_release <- function(filter_qualifying = FALSE) {
+  
+  if (filter_qualifying) {
+    
+    # Keep only qualifying charges
+    data.prelim <<- data.prelim[data.prelim$qualifying.charges.any == 1, ]
+    
+  } else {
+  #   # Force FTA to NA when defendant was not released under release_v1 - you *MAY* WANT TO COMMENT OUT IF FOCUSING ON QUALIFYING CHARGES.
+  # data.prelim <- data.prelim %>%
+  #   mutate(
+  #     fta_flag = ifelse(release_v1 == 0, NA_real_, fta_flag)
+  #   )
+    
+    # Set release_v2 = release_v1 for non-qualifying
+    idx <- data.prelim$qualifying.charges.any == 0
+    # data.prelim$release_v2[idx] <<- data.prelim$release_v1[idx]
+    
+    # Keep only non-qualifying
+    data.prelim <<- data.prelim[idx, ]
+  }
+}
+
+# # Non-Qualifying offenses
+# process_release()
+
+# Qualifying offenses
+process_release(TRUE)
+
+
+# Filter out fewer than 100 cases. 
+  ## get numbers
+  judge_release_table.prelim <- data.prelim %>%
+  group_by(Judge_Name) %>%
+  summarise(
+    n_cases = n(), # [2025.12.18] number of cases
+    pct_release_v1 = mean(release_v1, na.rm = TRUE) * 100,
+    pct_release_v2 = mean(release_v2, na.rm = TRUE) * 100
+  )
+  
+  ## judges with at least 100 cases (in the prelim table)
+keep_judges <- judge_release_table.prelim %>%
+  filter(n_cases >= 100) %>% # Standard
+  # filter(n_cases >= 150) %>% # Robustness check - A.7
+  # filter(n_cases >= 50) %>% # Robustness check - A.7
+    pull(Judge_Name)
+
+  ## filter data.prelim to only those judges
+  data.prelim.100 <- data.prelim %>%
+  filter(Judge_Name %in% keep_judges)
+  
+  ## complete the filtering
+  data.prelim <- data.prelim.100
+  
+# Overall FTA rate among defendants released under release_v2 but not release_v1
+# i.e., released with conditions / nonmonetary release
+fta_rate_release_v2_not_v1 <- data.prelim %>%
+  filter(release_v2 == 1, release_v1 == 0) %>%
+  summarise(
+    n_released_v2_not_v1 = n(),
+    n_nonmissing_fta = sum(!is.na(fta_flag)),
+    n_fta = sum(fta_flag == 1, na.rm = TRUE),
+    fta_rate = mean(fta_flag, na.rm = TRUE) * 100
+  )
+
+fta_rate_release_v2_not_v1
+```
+
+
+
+
+
+
+
