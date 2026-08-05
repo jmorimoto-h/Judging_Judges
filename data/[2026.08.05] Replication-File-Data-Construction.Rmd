@@ -1,0 +1,82 @@
+---
+title: '[2025.03.09] Simulations'
+author: "Anonymous"
+date: "2024-09-09"
+output: html_document
+---
+
+```{r}
+# Load the original datasets
+data.2020 <- read.csv("data.ny.2020.csv")
+data.2021 <- read.csv("data.ny.2021.csv")
+data.2022 <- read.csv("data.ny.2022.csv")
+data.2023 <- read.csv("data.ny.2023.csv")
+data.2024 <- read.csv("data.ny.2024.csv")
+
+
+# Function to split a data frame into 10 approximately equal parts
+split_and_save <- function(data, file_prefix, n_parts = 20) {
+  
+  # Assign each row to one of 10 approximately equal groups
+  part_number <- cut(
+    seq_len(nrow(data)),
+    breaks = n_parts,
+    labels = FALSE
+  )
+  
+  # Save each part as a separate CSV file
+  for (i in seq_len(n_parts)) {
+    write.csv(
+      data[part_number == i, , drop = FALSE],
+      sprintf("%s_part%02d.csv", file_prefix, i),
+      row.names = FALSE
+    )
+  }
+}
+
+
+# Split and save each dataset
+split_and_save(data.2020, "data.ny.2020")
+split_and_save(data.2021, "data.ny.2021")
+split_and_save(data.2022, "data.ny.2022")
+split_and_save(data.2023, "data.ny.2023")
+split_and_save(data.2024, "data.ny.2024")
+```
+
+
+```{r}
+# -------------------------------------------------------------------------
+# RECONSTRUCT THE ORIGINAL DATASETS FROM THE SPLIT CSV FILES
+# -------------------------------------------------------------------------
+
+# Function to read and combine all 10 parts
+combine_parts <- function(file_prefix, n_parts = 20) {
+
+  part_files <- sprintf(
+    "%s_part%02d.csv",
+    file_prefix,
+    seq_len(n_parts)
+  )
+
+  parts <- lapply(part_files, read.csv)
+
+  do.call(rbind, parts)
+}
+
+
+# Reconstruct the original data objects
+data.2020 <- combine_parts("data.ny.2020")
+data.2021 <- combine_parts("data.ny.2021")
+data.2022 <- combine_parts("data.ny.2022")
+data.2023 <- combine_parts("data.ny.2023")
+data.2024 <- combine_parts("data.ny.2024")
+
+
+# Optional: save the reconstructed datasets as their original CSV files
+write.csv(data.2020, "data.ny.2020.csv", row.names = FALSE)
+write.csv(data.2021, "data.ny.2021.csv", row.names = FALSE)
+write.csv(data.2022, "data.ny.2022.csv", row.names = FALSE)
+write.csv(data.2023, "data.ny.2023.csv", row.names = FALSE)
+write.csv(data.2024, "data.ny.2024.csv", row.names = FALSE)
+```
+
